@@ -234,8 +234,8 @@ def deve_buscar(texto):
 
 # ─── MÚSICA ────────────────────────────────────────────────────────────────────
 
-filas_musica = {}  # guild_id -> lista de urls
-voice_clients = {}  # guild_id -> voice_client
+filas_musica = {}  # guild_id -> lista de músicas
+voice_clients = {}  # guild_id -> voice client
 
 YTDL_OPTS = {
     "format": "bestaudio/best",
@@ -243,80 +243,136 @@ YTDL_OPTS = {
     "no_warnings": True,
     "default_search": "ytsearch",
     "source_address": "0.0.0.0",
+    "extract_flat": False,
 }
 
 FFMPEG_OPTS = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-    "options": "-vn",
+    "before_options": (
+        "-reconnect 1 "
+        "-reconnect_streamed 1 "
+        "-reconnect_delay_max 5"
+    ),
+    "options": "-vn"
 }
 
+
 async def get_audio_url(query):
-    with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
-        info = await asyncio.to_thread(lambda: ydl.extract_info(f"ytsearch:{query}", download=False))
-        if "entries" in info and info["entries"]:
-            entry = info["entries"][0]
-            return entry["url"], entry.get("title", query)
-        return None, None
+    try:
+        with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
+            info = await asyncio.to_thread(
+                lambda: ydl.extract_info(
+                    f"ytsearch:{query}",
+                    download=False
+                )
+            )
+
+            if "entries" in info and info["entries"]:
+                entry = info["entries"][0]
+
+                return (
+                    entry["url"],
+                    entry.get("title", query)
+                )
+
+    except Exception as e:
+        print(f"ERRO YTDLP: {e}")
+
+    return None, None
+
 
 async def tocar_proxima(guild_id):
-    if guild_id not in filas_musica or not filas_musica[guild_id]:
+    if guild_id not in filas_musica:
+        return
+
+    if not filas_musica[guild_id]:
         return
 
     vc = voice_clients.get(guild_id)
-    if not vc or not vc.is_connected():
+
+    if not vc:
+        return
+
+    if not vc.is_connected():
         return
 
     url, titulo = filas_musica[guild_id].pop(0)
 
     def depois(error):
-    if error:
-        print(f"ERRO MUSICA: {error}")
+        if error:
+            print(f"ERRO MUSICA: {error}")
 
-    asyncio.run_coroutine_threadsafe(
-        tocar_proxima(guild_id),
-        client.loop
-    )
-        asyncio.run_coroutine_threadsafe(tocar_proxima(guild_id), client.loop)
+        asyncio.run_coroutine_threadsafe(
+            tocar_proxima(guild_id),
+            client.loop
+        )
 
-    source = discord.FFmpegPCMAudio(
-url,
-executable="ffmpeg",
-**FFMPEG_OPTS
-)
-    vc.play(source, after=depois)
-    return titulo
+    try:
+        source = discord.FFmpegPCMAudio(
+            url,
+            executable="ffmpeg",
+            **FFMPEG_OPTS
+        )
+
+        vc.play(source, after=depois)
+
+        print(f"TOCANDO: {titulo}")
+
+        return titulo
+
+    except Exception as e:
+        print(f"ERRO PLAYBACK: {e}")
+        return None
+
 
 async def entrar_canal_voz(message):
     if not message.author.voice:
         return None, "vc nem tá em canal de voz"
-    async def entrar_canal_voz(message):
-if not message.author.voice:
-return None, "vc nem tá em canal de voz"
 
-canal = message.author.voice.channel
-guild_id = message.guild.id
+    canal = message.author.voice.channel
+    guild_id = message.guild.id
 
-existing = message.guild.voice_client
+    existing = message.guild.voice_client
 
-if existing:
+    # já conectado
+    if existing and existing.is_connected():
+
+        # já está no mesmo canal
+        if existing.channel.id == canal.id:
+            voice_clients[guild_id] = existing
+            return existing, None
+
+        # mover de canal
+        try:
+            await existing.move_to(canal)
+
+            voice_clients[guild_id] = existing
+
+            return existing, None
+
+        except Exception as e:
+            print(f"ERRO MOVE: {e}")
+
+            try:
+                await existing.disconnect(force=True)
+            except:
+                pass
+
+    # nova conexão
     try:
-        await existing.disconnect(force=True)
+        vc = await canal.connect(
+            reconnect=True,
+            timeout=30.0,
+            self_deaf=True
+        )
+
+        voice_clients[guild_id] = vc
+
+        return vc, None
+
     except Exception as e:
-        print(f"ERRO AO DESCONECTAR: {e}")
+        print(f"ERRO CONNECT: {e}")
 
-try:
-    vc = await canal.connect(
-        reconnect=True,
-        timeout=30.0,
-        self_deaf=True
-    )
-
-    voice_clients[guild_id] = vc
-    return vc, None
-
-except Exception as e:
-    print(f"ERRO AO CONECTAR: {e}")
-    return None, "deu erro pra conectar no canal"
+        return None, "deu erro pra conectar no canal"
 # ─── PROMPT ────────────────────────────────────────────────────────────────────
 
 PERSONALIDADE = """Você é Eva, 20 anos, brasileira.
