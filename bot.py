@@ -1,5 +1,4 @@
 import discord
-import requests
 import io
 import random
 import asyncio
@@ -235,7 +234,7 @@ def montar_contexto_usuario(user_id):
     return " | ".join(partes)
 
 # ─────────────────────────────────────────────────────────────
-# PESQUISA
+# PESQUISA (MUDADO PARA AIOHTTP ASSÍNCRONO)
 # ─────────────────────────────────────────────────────────────
 
 
@@ -254,12 +253,9 @@ def deve_buscar(texto):
     return any(g in texto.lower() for g in gatilhos)
 
 
-def buscar_duckduckgo(query):
-
+async def buscar_duckduckgo(query):
     try:
-
         url = "https://api.duckduckgo.com/"
-
         params = {
             "q": query,
             "format": "json",
@@ -267,21 +263,15 @@ def buscar_duckduckgo(query):
             "skip_disambig": 1
         }
 
-        r = requests.get(
-            url,
-            params=params,
-            timeout=8
-        )
-
-        data = r.json()
-
-        if data.get("AbstractText"):
-            return data["AbstractText"][:400]
-
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, timeout=8) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    if data.get("AbstractText"):
+                        return data["AbstractText"][:400]
         return None
-
     except Exception as e:
-        print(f"ERRO BUSCA: {e}")
+        print(f"ERRO BUSCA DUCKDUCKGO: {e}")
         return None
 
 # ─────────────────────────────────────────────────────────────
@@ -565,7 +555,7 @@ async def gerar_texto(user_id, texto, nome_discord=None):
 
     if deve_buscar(texto):
 
-        resultado = buscar_duckduckgo(texto)
+        resultado = await buscar_duckduckgo(texto)
 
         if resultado:
             contexto_extra = resultado
@@ -776,7 +766,8 @@ async def on_message(message):
         ])
 
         await message.reply(
-            f"```\n{lista}\n```"
+            f"```\n{lista}\n
+```"
         )
 
         return
