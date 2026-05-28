@@ -1,14 +1,18 @@
 FROM python:3.11-slim
 
-RUN apt-get update && apt-get install -y ffmpeg
+# Instala ffmpeg, codecs de áudio do Opus e ferramentas essenciais de sistema
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    libopus0 \
+    libopus-dev \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY requirements.txt .
-# O -U garante que o yt-dlp será instalado na versão mais recente disponível hoje
 RUN pip install --no-cache-dir -U -r requirements.txt
 
-# Copia o bot.py e o cookies.txt para dentro do contêiner
 COPY . .
 
 CMD ["python", "bot.py"]
