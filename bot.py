@@ -482,7 +482,7 @@ async def on_message(message):
         await message.reply(f"""```\n{lista}\n```""")
         return
 
-    # CHAT
+        # CHAT
     ativar = texto.startswith("eva/") or texto.startswith("evac/") or client.user in message.mentions
     if not ativar: return
 
@@ -494,13 +494,30 @@ async def on_message(message):
         resposta = await gerar_texto(message.author.id, texto_limpo, message.author.display_name)
 
         if texto.startswith("evac/"):
-            audio = await gerar_audio(resposta)
-            if audio:
-                arquivo = discord.File(fp=audio, filename="eva.mp3")
-                await message.reply(content=resposta, file=arquivo)
-            else: await message.reply(resposta)
+            audio_bytes_io = await gerar_audio(resposta)
+            if audio_bytes_io:
+                # Criamos um arquivo local temporário para evitar erros de TLS/Streaming no FFmpeg
+                temp_filename = f"temp_voice_{message.author.id}.mp3"
+                try:
+                    with open(temp_filename, "wb") as f:
+                        f.write(audio_bytes_io.getbuffer())
+                    
+                    # Enviamos o arquivo real salvo no disco
+                    arquivo = discord.File(temp_filename, filename="eva.mp3")
+                    await message.reply(content=resposta, file=arquivo)
+                except Exception as e:
+                    print(f"ERRO AO SALVAR ARQUIVO DE COMENTÁRIO: {e}")
+                    await message.reply(resposta)
+                finally:
+                    # Remove o arquivo temporário para não entupir a hospedagem
+                    if os.path.exists(temp_filename):
+                        try: os.remove(temp_filename)
+                        except: pass
+            else: 
+                await message.reply(resposta)
         else:
             await message.reply(resposta)
+
 
 # ─────────────────────────────────────────────────────────────
 # OPUS LOCAL LOAD
