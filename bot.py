@@ -1,4 +1,3 @@
-cat > /mnt/user-data/outputs/bot.py << 'EOF'
 import discord
 import requests
 import io
@@ -551,4 +550,3 @@ async def on_message(message):
             await message.reply(resposta)
 
 client.run(DISCORD_TOKEN)
-EOF
