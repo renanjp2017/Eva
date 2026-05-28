@@ -1,0 +1,6 @@
+discord.py
+google-generativeai
+requests
+pydantic
+python-dotenv
+openai
