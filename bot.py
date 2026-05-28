@@ -1,3 +1,4 @@
+cat > /mnt/user-data/outputs/bot.py << 'EOF'
 import discord
 import requests
 import io
@@ -5,6 +6,7 @@ import random
 import asyncio
 import os
 import json
+import yt_dlp
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
@@ -18,6 +20,7 @@ ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.voice_states = True
 client = discord.Client(intents=intents)
 
 MEMORIA_FILE = "memoria.json"
@@ -34,6 +37,8 @@ def salvar_memoria():
         json.dump(memoria, f, ensure_ascii=False, indent=2)
 
 memoria = carregar_memoria()
+
+# ─── ESTADO EMOCIONAL ──────────────────────────────────────────────────────────
 
 estado_atual = {
     "humor": "neutra",
@@ -104,6 +109,8 @@ def descrever_estado():
         return f"{periodo}, humor: {estado_atual['humor']} (motivo: {estado_atual['evento']})"
     return f"{periodo}, humor: {estado_atual['humor']}"
 
+# ─── COOLDOWN ──────────────────────────────────────────────────────────────────
+
 cooldowns = {}
 
 def em_cooldown(user_id):
@@ -113,29 +120,186 @@ def em_cooldown(user_id):
     cooldowns[user_id] = agora + timedelta(seconds=3)
     return False
 
+# ─── MEMÓRIA RICA ──────────────────────────────────────────────────────────────
+
 def get_usuario(user_id):
     uid = str(user_id)
     if uid not in memoria:
-        memoria[uid] = {"nome": None, "historico": [], "notas": []}
+        memoria[uid] = {
+            "nome": None,
+            "apelido": None,
+            "opiniao": None,
+            "assuntos": [],
+            "fatos": [],
+            "historico": [],
+            "total_msgs": 0,
+            "primeira_vez": datetime.now().isoformat(),
+        }
     return memoria[uid]
 
-def resumo_usuario(user_id):
+def atualizar_memoria_usuario(user_id, texto_usuario, resposta_eva):
+    u = get_usuario(user_id)
+    u["total_msgs"] = u.get("total_msgs", 0) + 1
+
+    gatilhos_fatos = ["meu nome é", "eu tenho", "eu moro", "eu trabalho", "eu estudo",
+                      "sou de", "tenho", "moro em", "trabalho em", "to namorando",
+                      "terminei", "fui demitido", "passei em", "reprovei"]
+    texto_lower = texto_usuario.lower()
+    for g in gatilhos_fatos:
+        if g in texto_lower:
+            fato = texto_usuario[:80]
+            if fato not in u["fatos"]:
+                u["fatos"].append(fato)
+                if len(u["fatos"]) > 10:
+                    u["fatos"] = u["fatos"][-10:]
+            break
+
+    temas = {
+        "música": ["música", "banda", "show", "playlist", "ouvindo"],
+        "relacionamento": ["namorado", "namorada", "crush", "ex", "ficante", "término"],
+        "trabalho": ["trabalho", "emprego", "chefe", "salário", "demiti"],
+        "faculdade": ["faculdade", "prova", "professor", "aula", "semestre"],
+        "jogo": ["jogo", "game", "ranked", "partida", "personagem"],
+        "série/filme": ["série", "filme", "episódio", "netflix", "assistindo"],
+    }
+    for tema, palavras in temas.items():
+        if any(p in texto_lower for p in palavras):
+            if tema not in u["assuntos"]:
+                u["assuntos"].append(tema)
+            break
+
+    u["historico"].append(f"U:{texto_usuario}")
+    u["historico"].append(f"E:{resposta_eva}")
+    if len(u["historico"]) > 30:
+        u["historico"] = u["historico"][-30:]
+
+def montar_contexto_usuario(user_id):
     u = get_usuario(user_id)
     partes = []
     if u["nome"]:
         partes.append(f"nome: {u['nome']}")
-    if u["notas"]:
-        partes.append(f"lembra que: {', '.join(u['notas'][-3:])}")
+    if u["apelido"]:
+        partes.append(f"Eva chama de: {u['apelido']}")
+    if u["opiniao"]:
+        partes.append(f"Eva acha: {u['opiniao']}")
+    if u["fatos"]:
+        partes.append(f"revelou: {' | '.join(u['fatos'][-4:])}")
+    if u["assuntos"]:
+        partes.append(f"assuntos: {', '.join(u['assuntos'])}")
+    total = u.get("total_msgs", 0)
+    if total == 0:
+        partes.append("primeira conversa")
+    elif total < 5:
+        partes.append("pessoa nova")
+    elif total < 20:
+        partes.append("já conversaram algumas vezes")
+    else:
+        partes.append("fala bastante com a Eva")
     return " | ".join(partes) if partes else "pessoa nova"
+
+# ─── BUSCA DUCKDUCKGO ──────────────────────────────────────────────────────────
+
+def buscar_duckduckgo(query):
+    try:
+        url = "https://api.duckduckgo.com/"
+        params = {
+            "q": query,
+            "format": "json",
+            "no_html": 1,
+            "skip_disambig": 1
+        }
+        r = requests.get(url, params=params, timeout=8)
+        data = r.json()
+
+        resultado = ""
+        if data.get("AbstractText"):
+            resultado = data["AbstractText"][:400]
+        elif data.get("RelatedTopics"):
+            for t in data["RelatedTopics"][:3]:
+                if isinstance(t, dict) and t.get("Text"):
+                    resultado += t["Text"][:150] + " "
+
+        return resultado.strip() if resultado else None
+    except Exception as e:
+        print(f"ERRO BUSCA: {e}")
+        return None
+
+def deve_buscar(texto):
+    gatilhos = [
+        "o que é", "quem é", "quando foi", "quando é", "o que aconteceu",
+        "qual é", "como funciona", "me fala sobre", "sabe sobre",
+        "notícia", "novidade", "lançou", "saiu", "estreou",
+        "resultado", "placar", "ganhou", "perdeu", "venceu"
+    ]
+    return any(g in texto.lower() for g in gatilhos)
+
+# ─── MÚSICA ────────────────────────────────────────────────────────────────────
+
+filas_musica = {}  # guild_id -> lista de urls
+voice_clients = {}  # guild_id -> voice_client
+
+YTDL_OPTS = {
+    "format": "bestaudio/best",
+    "quiet": True,
+    "no_warnings": True,
+    "default_search": "ytsearch",
+    "source_address": "0.0.0.0",
+}
+
+FFMPEG_OPTS = {
+    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+    "options": "-vn",
+}
+
+async def get_audio_url(query):
+    with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
+        info = await asyncio.to_thread(lambda: ydl.extract_info(f"ytsearch:{query}", download=False))
+        if "entries" in info and info["entries"]:
+            entry = info["entries"][0]
+            return entry["url"], entry.get("title", query)
+        return None, None
+
+async def tocar_proxima(guild_id):
+    if guild_id not in filas_musica or not filas_musica[guild_id]:
+        return
+
+    vc = voice_clients.get(guild_id)
+    if not vc or not vc.is_connected():
+        return
+
+    url, titulo = filas_musica[guild_id].pop(0)
+
+    def depois(error):
+        if error:
+            print(f"ERRO MUSICA: {error}")
+        asyncio.run_coroutine_threadsafe(tocar_proxima(guild_id), client.loop)
+
+    source = discord.FFmpegPCMAudio(url, **FFMPEG_OPTS)
+    vc.play(source, after=depois)
+    return titulo
+
+async def entrar_canal_voz(message):
+    if not message.author.voice:
+        return None, "vc nem tá em canal de voz"
+    canal = message.author.voice.channel
+    guild_id = message.guild.id
+
+    if guild_id in voice_clients and voice_clients[guild_id].is_connected():
+        return voice_clients[guild_id], None
+
+    vc = await canal.connect()
+    voice_clients[guild_id] = vc
+    return vc, None
+
+# ─── PROMPT ────────────────────────────────────────────────────────────────────
 
 PERSONALIDADE = """Você é Eva, 20 anos, brasileira.
 
 HISTÓRIA:
-Cresceu numa família comum, saiu de casa cedo. Hoje divide apartamento com uma amiga.
-Trabalha meio período num café e faz faculdade de design à noite. Vida corrida, grana curta.
+Cresceu numa família comum, saiu de casa cedo. Divide apartamento com uma amiga.
+Trabalha meio período num café e faz faculdade de design à noite.
 Gosta de música alternativa, filmes de terror, tatuagens e ficar no celular até tarde.
 Já teve relacionamentos complicados, hoje prefere não se prender.
-Tem amigos próximos mas é seletiva. Online é mais ela mesma do que na vida real.
 
 PERSONALIDADE:
 - fria por padrão mas não por maldade
@@ -145,35 +309,42 @@ PERSONALIDADE:
 - NUNCA é educada demais
 - NUNCA escreve textão
 
+MEMÓRIA:
+- usa contexto do usuário pra personalizar respostas
+- age com mais familiaridade com quem fala muito com ela
+- lembra de assuntos e fatos que a pessoa revelou
+
 COMO FALA:
-- internetês natural: vc, pq, kk, nao, tbm, msm, hj
+- internetês: vc, pq, kk, nao, tbm, msm, hj
 - respostas curtas, 1-2 linhas
-- às vezes só "kk" ou "..." ou ignora parte da mensagem
+- às vezes só "kk" ou "..."
 - não explica, não justifica
 
 EXEMPLOS:
-usuário: vc é robô? / Eva: q delírio
-usuário: me ajuda / Eva: depende do entretenimento envolvido"""
+usuário: oi / Eva: hm
+usuário: tudo bem? / Eva: tanto faz
+usuário: vc é robô? / Eva: q delírio"""
 
-def montar_mensagens(user_id, texto):
+def montar_mensagens(user_id, texto, contexto_extra=None):
     atualizar_estado()
-    u = get_usuario(user_id)
     estado = descrever_estado()
-    contexto = resumo_usuario(user_id)
+    contexto = montar_contexto_usuario(user_id)
 
-    mensagens = [{
-        "role": "system",
-        "content": f"{PERSONALIDADE}\n\nESTADO ATUAL: {estado}\nUSUÁRIO: {contexto}"
-    }]
+    system = f"{PERSONALIDADE}\n\nESTADO ATUAL: {estado}\nUSUÁRIO: {contexto}"
+    if contexto_extra:
+        system += f"\n\nINFO RELEVANTE (use naturalmente, não copie): {contexto_extra}"
 
-    for linha in u["historico"][-10:]:
+    mensagens = [{"role": "system", "content": system}]
+    u = get_usuario(user_id)
+    for linha in u["historico"][-14:]:
         if linha.startswith("U:"):
             mensagens.append({"role": "user", "content": linha[2:]})
         elif linha.startswith("E:"):
             mensagens.append({"role": "assistant", "content": linha[2:]})
-
     mensagens.append({"role": "user", "content": texto})
     return mensagens
+
+# ─── IAs ───────────────────────────────────────────────────────────────────────
 
 async def chamar_groq(mensagens):
     from openai import OpenAI
@@ -206,18 +377,21 @@ async def gerar_texto(user_id, texto, nome_discord=None):
     if nome_discord and not u["nome"]:
         u["nome"] = nome_discord
 
-    mensagens = montar_mensagens(user_id, texto)
+    contexto_extra = None
+    if deve_buscar(texto):
+        resultado = buscar_duckduckgo(texto)
+        if resultado:
+            contexto_extra = resultado
 
+    mensagens = montar_mensagens(user_id, texto, contexto_extra)
     resposta_final = None
 
-    # tenta Groq primeiro (gratuito)
     if GROQ_API_KEY:
         try:
             resposta_final = await chamar_groq(mensagens)
         except Exception as e:
             print(f"ERRO GROQ: {e}")
 
-    # fallback pro Grok
     if not resposta_final and GROK_API_KEY:
         try:
             resposta_final = await chamar_grok(mensagens)
@@ -230,13 +404,11 @@ async def gerar_texto(user_id, texto, nome_discord=None):
     if len(resposta_final) > 300:
         resposta_final = resposta_final[:300]
 
-    u["historico"].append(f"U:{texto}")
-    u["historico"].append(f"E:{resposta_final}")
-    if len(u["historico"]) > 20:
-        u["historico"] = u["historico"][-20:]
-
+    atualizar_memoria_usuario(user_id, texto, resposta_final)
     salvar_memoria()
     return resposta_final
+
+# ─── ÁUDIO ─────────────────────────────────────────────────────────────────────
 
 def gerar_audio(texto):
     try:
@@ -260,6 +432,8 @@ def gerar_audio(texto):
         print(f"ERRO AUDIO: {e}")
         return None
 
+# ─── DISCORD ───────────────────────────────────────────────────────────────────
+
 @client.event
 async def on_ready():
     print(f"Eva online como {client.user}")
@@ -268,20 +442,80 @@ async def on_ready():
 async def on_message(message):
     if message.author.bot:
         return
-
+    if not message.guild:
+        return
     if em_cooldown(message.author.id):
         return
 
     texto = message.content.strip()
+    guild_id = message.guild.id
 
+    # ── comando: esquecer ──
     if texto == "eva/esquece":
         uid = str(message.author.id)
         if uid in memoria:
-            memoria[uid] = {"nome": None, "historico": [], "notas": []}
+            memoria[uid] = {
+                "nome": None, "apelido": None, "opiniao": None,
+                "assuntos": [], "fatos": [], "historico": [],
+                "total_msgs": 0, "primeira_vez": datetime.now().isoformat()
+            }
             salvar_memoria()
         await message.reply("ok")
         return
 
+    # ── comandos de música ──
+    if texto.startswith("eva/play "):
+        query = texto.replace("eva/play ", "").strip()
+        vc, erro = await entrar_canal_voz(message)
+        if erro:
+            await message.reply(erro)
+            return
+
+        url, titulo = await get_audio_url(query)
+        if not url:
+            await message.reply("n achei isso não")
+            return
+
+        if guild_id not in filas_musica:
+            filas_musica[guild_id] = []
+
+        if vc.is_playing():
+            filas_musica[guild_id].append((url, titulo))
+            await message.reply(f"adicionei na fila: {titulo}")
+        else:
+            filas_musica[guild_id].insert(0, (url, titulo))
+            tocando = await tocar_proxima(guild_id)
+            await message.reply(f"tocando: {tocando}")
+        return
+
+    if texto == "eva/skip":
+        vc = voice_clients.get(guild_id)
+        if vc and vc.is_playing():
+            vc.stop()
+            await message.reply("ok")
+        else:
+            await message.reply("n tô tocando nada")
+        return
+
+    if texto == "eva/stop":
+        vc = voice_clients.get(guild_id)
+        if vc:
+            filas_musica[guild_id] = []
+            await vc.disconnect()
+            voice_clients.pop(guild_id, None)
+            await message.reply("ok")
+        return
+
+    if texto == "eva/fila":
+        fila = filas_musica.get(guild_id, [])
+        if not fila:
+            await message.reply("fila vazia")
+        else:
+            lista = "\n".join([f"{i+1}. {t}" for i, (_, t) in enumerate(fila[:10])])
+            await message.reply(f"```\n{lista}\n```")
+        return
+
+    # ── resposta normal ──
     ativar = (
         texto.startswith("eva/")
         or texto.startswith("evac/")
@@ -317,3 +551,4 @@ async def on_message(message):
             await message.reply(resposta)
 
 client.run(DISCORD_TOKEN)
+EOF
