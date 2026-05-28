@@ -269,13 +269,13 @@ async def tocar_proxima(guild_id):
     url, titulo = filas_musica[guild_id].pop(0)
 
     def depois(error):
-if error:
-print(f"ERRO MUSICA: {error}")
+    if error:
+        print(f"ERRO MUSICA: {error}")
 
-asyncio.run_coroutine_threadsafe(
-    tocar_proxima(guild_id),
-    client.loop
-)
+    asyncio.run_coroutine_threadsafe(
+        tocar_proxima(guild_id),
+        client.loop
+    )
         asyncio.run_coroutine_threadsafe(tocar_proxima(guild_id), client.loop)
 
     source = discord.FFmpegPCMAudio(
