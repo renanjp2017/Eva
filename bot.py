@@ -748,8 +748,8 @@ async def on_message(message):
 
         return
 
-    # ─────────────────────────
-    # FILA
+        # ─────────────────────────
+    # FILA (VERSÃO BLINDADA)
     # ─────────────────────────
 
     if texto == "eva/fila":
@@ -765,8 +765,10 @@ async def on_message(message):
             for i, (_, t) in enumerate(fila[:10])
         ])
 
-        await message.reply(f"```\n{lista}\n
-```")
+        # Construção segura sem quebras de linha que confundam o Python
+        bloco_codigo = "```" + "\n" + lista + "\n" + "```"
+        
+        await message.reply(bloco_codigo)
 
         return
 
