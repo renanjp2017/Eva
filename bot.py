@@ -275,7 +275,7 @@ async def buscar_duckduckgo(query):
         return None
 
 # ─────────────────────────────────────────────────────────────
-# YTDLP (MODIFICADO PARA SOUNDCLOUD)
+# YTDLP (VOLTAMOS PARA YOUTUBE COM PROTEÇÃO DRM)
 # ─────────────────────────────────────────────────────────────
 
 filas_musica = {}
@@ -285,11 +285,18 @@ YTDL_OPTS = {
     "format": "bestaudio/best",
     "quiet": True,
     "no_warnings": True,
-    "default_search": "scsearch",
+    "default_search": "ytsearch",
     "source_address": "0.0.0.0",
     "extract_flat": False,
     "nocheckcertificate": True,
     "ignoreerrors": True,
+    "cookiefile": "cookies.txt", 
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["android", "web"],
+            "skip": ["dash", "hls"]
+        }
+    }
 }
 
 FFMPEG_OPTS = {
@@ -305,12 +312,14 @@ FFMPEG_OPTS = {
 async def get_audio_url(query):
 
     try:
+        # Voltou a inteligência de saber se é um link direto ou pesquisa em texto
+        busca = query if ("youtube.com/" in query or "youtu.be/" in query) else f"ytsearch1:{query}"
 
         with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
 
             info = await asyncio.to_thread(
                 lambda: ydl.extract_info(
-                    f"scsearch1:{query}",
+                    busca,
                     download=False
                 )
             )
@@ -334,7 +343,7 @@ async def get_audio_url(query):
             )
 
     except Exception as e:
-        print(f"ERRO YTDLP (SoundCloud): {e}")
+        print(f"ERRO YTDLP (YouTube): {e}")
         return None, None
 
 
@@ -587,7 +596,7 @@ async def gerar_texto(user_id, texto, nome_discord=None):
     return resposta[:300]
 
 # ─────────────────────────────────────────────────────────────
-# ELEVENLABS (ASSÍNCRONA COM SUPORTE A DOCKER)
+# ELEVENLABS
 # ─────────────────────────────────────────────────────────────
 
 
@@ -677,7 +686,7 @@ async def on_message(message):
 
         if not url:
             await message.reply(
-                "não consegui encontrar essa música no soundcloud"
+                "não consegui encontrar essa música ou o link falhou (tente usar o link direto ou atualize o cookies.txt)."
             )
             return
 
@@ -748,8 +757,8 @@ async def on_message(message):
 
         return
 
-        # ─────────────────────────
-    # FILA (VERSÃO BLINDADA)
+    # ─────────────────────────
+    # FILA (BLINDADA CONTRA ERROS DE SINTAXE)
     # ─────────────────────────
 
     if texto == "eva/fila":
@@ -765,10 +774,9 @@ async def on_message(message):
             for i, (_, t) in enumerate(fila[:10])
         ])
 
-        # Construção segura sem quebras de linha que confundam o Python
-        bloco_codigo = "```" + "\n" + lista + "\n" + "```"
+        msg_formatada = "```\n" + lista + "\n```"
         
-        await message.reply(bloco_codigo)
+        await message.reply(msg_formatada)
 
         return
 
@@ -860,6 +868,4 @@ except:
 
 # ─────────────────────────────────────────────────────────────
 # RUN
-# ─────────────────────────────────────────────────────────────
-
-client.run(DISCORD_TOKEN)
+# ─────────────────────────────────────
