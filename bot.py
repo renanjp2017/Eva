@@ -193,7 +193,7 @@ async def buscar_duckduckgo(query):
         return None
 
 # ─────────────────────────────────────────────────────────────
-# YTDLP (YOUTUBE BURLADO SEM COOKIES)
+# YTDLP (BURLA DE DISPOSITIVO IOS / MUSIC PARA EVITAR CAPTCHA)
 # ─────────────────────────────────────────────────────────────
 
 filas_musica = {}
@@ -208,9 +208,10 @@ YTDL_OPTS = {
     "extract_flat": False,
     "nocheckcertificate": True,
     "ignoreerrors": True,
+    # Nova ordem de clients simulados para contornar o bloqueio de bot do YouTube
     "extractor_args": {
         "youtube": {
-            "player_client": ["android", "tvhtml5embedded"],
+            "player_client": ["ios", "tvhtml5embedded"],
             "skip": ["dash", "hls"]
         }
     }
