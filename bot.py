@@ -269,27 +269,54 @@ async def tocar_proxima(guild_id):
     url, titulo = filas_musica[guild_id].pop(0)
 
     def depois(error):
-        if error:
-            print(f"ERRO MUSICA: {error}")
+if error:
+print(f"ERRO MUSICA: {error}")
+
+asyncio.run_coroutine_threadsafe(
+    tocar_proxima(guild_id),
+    client.loop
+)
         asyncio.run_coroutine_threadsafe(tocar_proxima(guild_id), client.loop)
 
-    source = discord.FFmpegPCMAudio(url, **FFMPEG_OPTS)
+    source = discord.FFmpegPCMAudio(
+url,
+executable="ffmpeg",
+**FFMPEG_OPTS
+)
     vc.play(source, after=depois)
     return titulo
 
 async def entrar_canal_voz(message):
     if not message.author.voice:
         return None, "vc nem tá em canal de voz"
-    canal = message.author.voice.channel
-    guild_id = message.guild.id
+    async def entrar_canal_voz(message):
+if not message.author.voice:
+return None, "vc nem tá em canal de voz"
 
-    if guild_id in voice_clients and voice_clients[guild_id].is_connected():
-        return voice_clients[guild_id], None
+canal = message.author.voice.channel
+guild_id = message.guild.id
 
-    vc = await canal.connect()
+existing = message.guild.voice_client
+
+if existing:
+    try:
+        await existing.disconnect(force=True)
+    except Exception as e:
+        print(f"ERRO AO DESCONECTAR: {e}")
+
+try:
+    vc = await canal.connect(
+        reconnect=True,
+        timeout=30.0,
+        self_deaf=True
+    )
+
     voice_clients[guild_id] = vc
     return vc, None
 
+except Exception as e:
+    print(f"ERRO AO CONECTAR: {e}")
+    return None, "deu erro pra conectar no canal"
 # ─── PROMPT ────────────────────────────────────────────────────────────────────
 
 PERSONALIDADE = """Você é Eva, 20 anos, brasileira.
