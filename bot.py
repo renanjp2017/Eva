@@ -475,8 +475,7 @@ async def on_message(message):
             await message.reply("fila vazia")
             return
         lista = "\n".join([f"{i+1}. {t}" for i, (_, t) in enumerate(fila[:10])])
-        await message.reply(f"```\n{lista}\n
-```")
+        await message.reply(f"""```\n{lista}\n```""")
         return
 
     # CHAT
