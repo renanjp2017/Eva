@@ -193,7 +193,8 @@ async def buscar_duckduckgo(query):
         return None
 
 # ─────────────────────────────────────────────────────────────
-# YTDLP (BURLA DE AUTENTICAÇÃO OAUTH PARA HOSPEDAGENS)
+# ─────────────────────────────────────────────────────────────
+# YTDLP (AJUSTADO PARA CLIENTE WEB/ANDROID EVITANDO DRM)
 # ─────────────────────────────────────────────────────────────
 
 filas_musica = {}
@@ -201,23 +202,23 @@ voice_clients = {}
 
 YTDL_OPTS = {
     "format": "bestaudio/best",
-    "quiet": False,  # Deixamos False para você conseguir ver o link do OAuth nos logs se precisar
-    "no_warnings": False,
+    "quiet": True,
+    "no_warnings": True,
     "default_search": "ytsearch",
     "source_address": "0.0.0.0",
     "extract_flat": False,
     "nocheckcertificate": True,
     "ignoreerrors": True,
+    "cookiefile": "cookies.txt", 
     "extractor_args": {
         "youtube": {
-            # Habilita o login via dispositivo (OAuth) simulando uma TV. 
-            # Evita o bloqueio por IP e cria um token seguro na pasta do bot.
-            "oauth2_input_required": [True],
-            "player_client": ["tv", "ios"],
+            # Mudamos para usar a interface Web e Android padrão, eliminando o erro de DRM e PO Token das TVs/iOS
+            "player_client": ["web", "android"],
             "skip": ["dash", "hls"]
         }
     }
 }
+
 
 FFMPEG_OPTS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
