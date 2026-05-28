@@ -4,5 +4,3 @@ PyNaCl
 python-dotenv
 openai
 aiohttp
-requests
-google-generativeai
