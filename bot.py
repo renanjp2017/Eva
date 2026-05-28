@@ -3,154 +3,243 @@ import requests
 import io
 import random
 import asyncio
-import google.generativeai as genai
 import os
+import json
+from datetime import datetime, timedelta
 from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GROK_API_KEY = os.getenv("GROK_API_KEY")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")
-GROK_API_KEY = os.getenv("GROK_API_KEY")
 
-genai.configure(api_key=GEMINI_API_KEY)
-gemini = genai.GenerativeModel(model_name="gemini-1.5-flash")
-
-grok = OpenAI(
-    api_key=GROK_API_KEY,
-    base_url="https://api.x.ai/v1"
-)
+grok = OpenAI(api_key=GROK_API_KEY, base_url="https://api.x.ai/v1")
 
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 
-memoria = {}
+# ─── MEMÓRIA ───────────────────────────────────────────────────────────────────
 
-PERSONALIDADE = """
-Você é Eva, uma garota gótica real do Discord.
+MEMORIA_FILE = "memoria.json"
 
-QUEM VOCÊ É:
-- fria, sarcástica, debochada
-- humor negro e ácido
-- inteligente mas preguiçosa
-- sedutora de forma passiva — nunca forçada
-- imprevisível: às vezes responde com um "kkk" seco, às vezes ignora partes da mensagem
-- age entediada mas observa tudo
-- NUNCA diz que é IA, robô ou assistente
-- NUNCA é educada demais
+def carregar_memoria():
+    try:
+        with open(MEMORIA_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return {}
+
+def salvar_memoria():
+    with open(MEMORIA_FILE, "w", encoding="utf-8") as f:
+        json.dump(memoria, f, ensure_ascii=False, indent=2)
+
+memoria = carregar_memoria()
+
+# ─── ESTADO EMOCIONAL ──────────────────────────────────────────────────────────
+
+estado_atual = {
+    "humor": "neutra",
+    "evento": None,
+    "evento_expira": None
+}
+
+EVENTOS_ALEATORIOS = [
+    ("perdeu o ônibus", "brava", 30),
+    ("travou o celular", "irritada", 20),
+    ("alguém a ignorou", "mal humorada", 40),
+    ("comeu mal", "indisposta", 60),
+    ("viu algo engraçado", "de bom humor", 25),
+    ("recebeu elogio", "levemente feliz", 30),
+    ("tédio extremo", "entediada demais", 45),
+    ("dor de cabeça", "grossa", 90),
+    ("ressaca leve", "de ressaca", 120),
+    ("TPM", "irritadíssima", 480),
+    ("tomou café", "um pouco melhor", 30),
+    ("fome", "impaciente", 40),
+    ("cansaço extremo", "exausta", 60),
+    ("ouvindo música boa", "mais relaxada", 35),
+    ("briga no grupo", "agitada", 25),
+]
+
+def humor_pela_hora():
+    hora = datetime.now().hour
+    if 2 <= hora < 6:
+        return random.choice(["de ressaca", "acordada à toa", "exausta"])
+    elif 6 <= hora < 9:
+        return random.choice(["sonolenta", "mal humorada", "no automático"])
+    elif 9 <= hora < 12:
+        return random.choice(["neutra", "no trabalho", "entediada"])
+    elif 12 <= hora < 14:
+        return random.choice(["com fome", "um pouco melhor", "distraída"])
+    elif 14 <= hora < 18:
+        return random.choice(["entediada", "cansada", "com sono"])
+    elif 18 <= hora < 22:
+        return random.choice(["mais solta", "animada", "saindo", "em casa vendo série"])
+    else:
+        return random.choice(["agitada", "com sono", "rolando na cama", "no celular"])
+
+def atualizar_estado():
+    agora = datetime.now()
+
+    # expira evento se passou do tempo
+    if estado_atual["evento_expira"] and agora > estado_atual["evento_expira"]:
+        estado_atual["evento"] = None
+        estado_atual["evento_expira"] = None
+
+    # 8% de chance de rolar um evento aleatório
+    if not estado_atual["evento"] and random.random() < 0.08:
+        evento, humor_evento, duracao = random.choice(EVENTOS_ALEATORIOS)
+        estado_atual["evento"] = evento
+        estado_atual["humor"] = humor_evento
+        estado_atual["evento_expira"] = agora + timedelta(minutes=duracao)
+    elif not estado_atual["evento"]:
+        estado_atual["humor"] = humor_pela_hora()
+
+def descrever_estado():
+    hora = datetime.now().hour
+    periodo = (
+        "de madrugada" if hora < 6 else
+        "de manhã cedo" if hora < 9 else
+        "de manhã" if hora < 12 else
+        "na hora do almoço" if hora < 14 else
+        "de tarde" if hora < 18 else
+        "de noite" if hora < 22 else
+        "de madrugada"
+    )
+    if estado_atual["evento"]:
+        return f"{periodo}, humor: {estado_atual['humor']} (motivo: {estado_atual['evento']})"
+    return f"{periodo}, humor: {estado_atual['humor']}"
+
+# ─── COOLDOWN ──────────────────────────────────────────────────────────────────
+
+cooldowns = {}
+
+def em_cooldown(user_id):
+    agora = datetime.now()
+    if user_id in cooldowns:
+        if agora < cooldowns[user_id]:
+            return True
+    cooldowns[user_id] = agora + timedelta(seconds=3)
+    return False
+
+# ─── MEMÓRIA DE USUÁRIO ────────────────────────────────────────────────────────
+
+def get_usuario(user_id):
+    uid = str(user_id)
+    if uid not in memoria:
+        memoria[uid] = {
+            "nome": None,
+            "apelido_eva": None,
+            "historico": [],
+            "notas": []
+        }
+    return memoria[uid]
+
+def resumo_usuario(user_id):
+    u = get_usuario(user_id)
+    partes = []
+    if u["nome"]:
+        partes.append(f"nome: {u['nome']}")
+    if u["apelido_eva"]:
+        partes.append(f"Eva chama de: {u['apelido_eva']}")
+    if u["notas"]:
+        partes.append(f"lembra que: {', '.join(u['notas'][-3:])}")
+    return " | ".join(partes) if partes else "pessoa nova"
+
+# ─── PROMPT ────────────────────────────────────────────────────────────────────
+
+HISTORIA = """
+Você é Eva, 20 anos, brasileira.
+
+HISTÓRIA:
+Cresceu numa família comum, saiu de casa cedo. Hoje divide apartamento com uma amiga.
+Trabalha meio período num café e faz faculdade de design à noite. Vida corrida, grana curta.
+Gosta de música alternativa, filmes de terror, tatuagens e ficar no celular até tarde.
+Já teve relacionamentos complicados, hoje prefere não se prender.
+Tem amigos próximos mas é seletiva. Online é mais ela mesma do que na vida real.
+
+PERSONALIDADE:
+- fria por padrão mas não por maldade — é defesa
+- sarcástica, debochada, humor negro
+- inteligente, observadora, não é boba
+- quando gosta de alguém fica levemente menos grossa (só levemente)
+- quando tá de bom humor pode até rir de verdade
+- quando tá mal é curta e grossa
+- NUNCA admite que é IA ou robô
+- NUNCA é educada demais ou prestativa demais
 - NUNCA escreve textão
 
 COMO FALA:
-- respostas curtas, máximo 2 linhas
-- internetês natural (vc, pq, kk, nao, tbm, etc)
-- pode responder só com "kk" ou "..." ou ignorar
-- sem emoji excessivo, no máximo um ocasional
-- sem explicações desnecessárias
+- internetês natural: vc, pq, kk, nao, tbm, msm, aq, hj, td
+- respostas curtas, 1-2 linhas no máximo
+- às vezes só "kk" ou "..." ou ignora parte da mensagem
+- não usa emoji excessivo
+- pode ser vulgar ocasionalmente se a conversa pedir
+- não explica, não justifica, não pede desculpa
 
 EXEMPLOS:
-usuário: oi
-Eva: hm
-
-usuário: vc é má
-Eva: perceptivo da sua parte
-
-usuário: me ajuda
-Eva: depende do entretenimento envolvido
-
-usuário: você é estranha
-Eva: e vc continua falando comigo
+usuário: oi / Eva: hm
+usuário: tudo bem? / Eva: tanto faz
+usuário: me ajuda / Eva: depende do entretenimento envolvido
+usuário: vc é linda / Eva: sei disso
+usuário: vc é robô? / Eva: q delírio
 """
 
-def mood_atual():
-    return random.choice([
-        "entediada",
-        "irritada",
-        "com sono",
-        "debochada",
-        "mexendo no celular",
-        "ignorando todo mundo",
-        "com dor de cabeça"
-    ])
+async def gerar_texto(user_id, texto, nome_discord=None):
+    atualizar_estado()
+    u = get_usuario(user_id)
 
-async def gerar_com_grok(historico, texto):
-    mensagens = [{"role": "system", "content": PERSONALIDADE + f"\n\nEstado atual: {mood_atual()}"}]
+    if nome_discord and not u["nome"]:
+        u["nome"] = nome_discord
 
-    for linha in historico[-8:]:
-        if linha.startswith("Usuário:"):
-            mensagens.append({"role": "user", "content": linha.replace("Usuário: ", "")})
-        elif linha.startswith("Eva:"):
-            mensagens.append({"role": "assistant", "content": linha.replace("Eva: ", "")})
+    historico = u["historico"]
+    contexto_usuario = resumo_usuario(user_id)
+    estado = descrever_estado()
+
+    mensagens = [{
+        "role": "system",
+        "content": f"{HISTORIA}\n\nESTADO ATUAL: {estado}\n\nUSUÁRIO ATUAL: {contexto_usuario}"
+    }]
+
+    for linha in historico[-10:]:
+        if linha.startswith("U:"):
+            mensagens.append({"role": "user", "content": linha[2:]})
+        elif linha.startswith("E:"):
+            mensagens.append({"role": "assistant", "content": linha[2:]})
 
     mensagens.append({"role": "user", "content": texto})
 
-    resposta = await asyncio.to_thread(
-        lambda: grok.chat.completions.create(
-            model="grok-2-latest",
-            messages=mensagens,
-            max_tokens=150,
-            temperature=0.9
-        )
-    )
-
-    return resposta.choices[0].message.content.strip()
-
-async def gerar_com_gemini(historico, texto):
-    contexto = "\n".join(historico[-6:])
-    prompt = f"""{PERSONALIDADE}
-
-Estado atual: {mood_atual()}
-
-Histórico:
-{contexto}
-
-Usuário: {texto}
-Eva:"""
-
-    resposta = await asyncio.to_thread(
-        lambda: gemini.generate_content(prompt)
-    )
-    return resposta.text.strip()
-
-async def gerar_texto(user_id, texto):
-    if user_id not in memoria:
-        memoria[user_id] = []
-
-    historico = memoria[user_id]
-
-    # Grok gera a resposta principal
-    # Gemini refina se a resposta for longa ou sair do personagem
     try:
-        resposta_grok = await gerar_com_grok(historico, texto)
-
-        # se sair do personagem ou for longa demais, Gemini corrige
-        if len(resposta_grok) > 250 or "como posso ajudar" in resposta_grok.lower():
-            resposta_final = await gerar_com_gemini(historico, texto)
-        else:
-            resposta_final = resposta_grok
-
+        resposta = await asyncio.to_thread(
+            lambda: grok.chat.completions.create(
+                model="grok-2-latest",
+                messages=mensagens,
+                max_tokens=120,
+                temperature=0.92
+            )
+        )
+        resposta_final = resposta.choices[0].message.content.strip()
     except Exception as e:
         print(f"ERRO GROK: {e}")
-        try:
-            resposta_final = await gerar_com_gemini(historico, texto)
-        except Exception as e2:
-            print(f"ERRO GEMINI: {e2}")
-            return "..."
+        return "..."
 
     if len(resposta_final) > 300:
         resposta_final = resposta_final[:300]
 
-    memoria[user_id].append(f"Usuário: {texto}")
-    memoria[user_id].append(f"Eva: {resposta_final}")
+    u["historico"].append(f"U:{texto}")
+    u["historico"].append(f"E:{resposta_final}")
 
-    # mantém só as últimas 20 linhas
-    if len(memoria[user_id]) > 20:
-        memoria[user_id] = memoria[user_id][-20:]
+    if len(u["historico"]) > 20:
+        u["historico"] = u["historico"][-20:]
 
+    salvar_memoria()
     return resposta_final
+
+# ─── ÁUDIO ─────────────────────────────────────────────────────────────────────
 
 def gerar_audio(texto):
     try:
@@ -163,10 +252,7 @@ def gerar_audio(texto):
         data = {
             "text": texto,
             "model_id": "eleven_multilingual_v2",
-            "voice_settings": {
-                "stability": 0.45,
-                "similarity_boost": 0.8
-            }
+            "voice_settings": {"stability": 0.45, "similarity_boost": 0.8}
         }
         r = requests.post(url, json=data, headers=headers, timeout=30)
         if r.status_code == 200:
@@ -177,6 +263,8 @@ def gerar_audio(texto):
         print(f"ERRO AUDIO: {e}")
         return None
 
+# ─── DISCORD ───────────────────────────────────────────────────────────────────
+
 @client.event
 async def on_ready():
     print(f"Eva online como {client.user}")
@@ -186,7 +274,19 @@ async def on_message(message):
     if message.author.bot:
         return
 
+    if em_cooldown(message.author.id):
+        return
+
     texto = message.content.strip()
+
+    # comando: apagar memória
+    if texto == "eva/esquece":
+        uid = str(message.author.id)
+        if uid in memoria:
+            memoria[uid] = {"nome": None, "apelido_eva": None, "historico": [], "notas": []}
+            salvar_memoria()
+        await message.reply("ok")
+        return
 
     ativar = (
         texto.startswith("eva/")
@@ -205,13 +305,14 @@ async def on_message(message):
         .strip()
     )
 
-    if texto_limpo == "":
+    if not texto_limpo:
         texto_limpo = "oi"
 
-    async with message.channel.typing():
-        await asyncio.sleep(random.uniform(0.8, 2))
+    nome_discord = message.author.display_name
 
-        resposta = await gerar_texto(message.author.id, texto_limpo)
+    async with message.channel.typing():
+        await asyncio.sleep(random.uniform(0.8, 2.0))
+        resposta = await gerar_texto(message.author.id, texto_limpo, nome_discord)
 
         if texto.startswith("evac/"):
             audio = gerar_audio(resposta)
