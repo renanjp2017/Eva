@@ -193,7 +193,7 @@ async def buscar_duckduckgo(query):
         return None
 
 # ─────────────────────────────────────────────────────────────
-# YTDLP (BURLAR COMPLETO USANDO YOUTUBE SEM COOKIES)
+# YTDLP (YOUTUBE BURLADO SEM COOKIES)
 # ─────────────────────────────────────────────────────────────
 
 filas_musica = {}
@@ -208,7 +208,6 @@ YTDL_OPTS = {
     "extract_flat": False,
     "nocheckcertificate": True,
     "ignoreerrors": True,
-    # TRUQUE DE BURLA: Usa a API de Android/TV para ignorar os bloqueios de login/cookies
     "extractor_args": {
         "youtube": {
             "player_client": ["android", "tvhtml5embedded"],
@@ -224,7 +223,6 @@ FFMPEG_OPTS = {
 
 async def get_audio_url(query):
     try:
-        # Se for um link direto do youtube/youtu.be, usa direto. Se for texto, pesquisa.
         busca = query if ("youtube.com/" in query or "youtu.be/" in query) else f"ytsearch1:{query}"
         
         with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
