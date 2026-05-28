@@ -3,4 +3,4 @@ yt-dlp
 PyNaCl
 python-dotenv
 openai
-aiohttp
+requests
