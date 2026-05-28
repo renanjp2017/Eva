@@ -193,7 +193,7 @@ async def buscar_duckduckgo(query):
         return None
 
 # ─────────────────────────────────────────────────────────────
-# YTDLP (SOUNDCLOUD)
+# YTDLP (BURLAR COMPLETO USANDO YOUTUBE SEM COOKIES)
 # ─────────────────────────────────────────────────────────────
 
 filas_musica = {}
@@ -203,11 +203,18 @@ YTDL_OPTS = {
     "format": "bestaudio/best",
     "quiet": True,
     "no_warnings": True,
-    "default_search": "scsearch",
+    "default_search": "ytsearch",
     "source_address": "0.0.0.0",
     "extract_flat": False,
     "nocheckcertificate": True,
     "ignoreerrors": True,
+    # TRUQUE DE BURLA: Usa a API de Android/TV para ignorar os bloqueios de login/cookies
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["android", "tvhtml5embedded"],
+            "skip": ["dash", "hls"]
+        }
+    }
 }
 
 FFMPEG_OPTS = {
@@ -217,9 +224,12 @@ FFMPEG_OPTS = {
 
 async def get_audio_url(query):
     try:
+        # Se for um link direto do youtube/youtu.be, usa direto. Se for texto, pesquisa.
+        busca = query if ("youtube.com/" in query or "youtu.be/" in query) else f"ytsearch1:{query}"
+        
         with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
             info = await asyncio.to_thread(
-                lambda: ydl.extract_info(f"scsearch1:{query}", download=False)
+                lambda: ydl.extract_info(busca, download=False)
             )
 
             if not info: return None, None
@@ -233,7 +243,7 @@ async def get_audio_url(query):
             return entry.get("url"), entry.get("title", query)
 
     except Exception as e:
-        print(f"ERRO YTDLP (SoundCloud): {e}")
+        print(f"ERRO YTDLP (YouTube): {e}")
         return None, None
 
 async def tocar_proxima(guild_id):
@@ -424,7 +434,7 @@ async def on_message(message):
         
         url, titulo = await get_audio_url(query)
         if not url:
-            await message.reply("não consegui encontrar essa música no soundcloud")
+            await message.reply("não consegui carregar esse áudio do youtube.")
             return
 
         if guild_id not in filas_musica: filas_musica[guild_id] = []
@@ -467,7 +477,8 @@ async def on_message(message):
             await message.reply("fila vazia")
             return
         lista = "\n".join([f"{i+1}. {t}" for i, (_, t) in enumerate(fila[:10])])
-        await message.reply(f"```\n{lista}\n```")
+        await message.reply(f"```\n{lista}\n
+```")
         return
 
     # CHAT
