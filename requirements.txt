@@ -1,6 +1,6 @@
-discord.py
+discord.py[voice]
 yt-dlp
-pynacl
+PyNaCl
 python-dotenv
 openai
 requests
