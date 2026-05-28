@@ -209,13 +209,14 @@ YTDL_OPTS = {
     "extract_flat": False,
     "nocheckcertificate": True,
     "ignoreerrors": True,
-    "cookiefile": "cookies.txt",  # <-- Adicionado para autenticação no YouTube
+    "cookiefile": "cookies.txt",  # Aqui ele vai ler o arquivo que você exportou
     "extractor_args": {
         "youtube": {
-            "player_client": ["android", "web"] # Ajuste para contornar bloqueios recentes
+            "player_client": ["tv", "web"] # 'tv' tem menos chance de ser bloqueado
         }
     }
 }
+
 
 FFMPEG_OPTS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
