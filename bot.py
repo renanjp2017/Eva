@@ -193,7 +193,7 @@ async def buscar_duckduckgo(query):
         return None
 
 # ─────────────────────────────────────────────────────────────
-# YTDLP (BURLA DE DISPOSITIVO IOS / MUSIC PARA EVITAR CAPTCHA)
+# YTDLP (BURLA DE AUTENTICAÇÃO OAUTH PARA HOSPEDAGENS)
 # ─────────────────────────────────────────────────────────────
 
 filas_musica = {}
@@ -201,17 +201,19 @@ voice_clients = {}
 
 YTDL_OPTS = {
     "format": "bestaudio/best",
-    "quiet": True,
-    "no_warnings": True,
+    "quiet": False,  # Deixamos False para você conseguir ver o link do OAuth nos logs se precisar
+    "no_warnings": False,
     "default_search": "ytsearch",
     "source_address": "0.0.0.0",
     "extract_flat": False,
     "nocheckcertificate": True,
     "ignoreerrors": True,
-    # Nova ordem de clients simulados para contornar o bloqueio de bot do YouTube
     "extractor_args": {
         "youtube": {
-            "player_client": ["ios", "tvhtml5embedded"],
+            # Habilita o login via dispositivo (OAuth) simulando uma TV. 
+            # Evita o bloqueio por IP e cria um token seguro na pasta do bot.
+            "oauth2_input_required": [True],
+            "player_client": ["tv", "ios"],
             "skip": ["dash", "hls"]
         }
     }
@@ -433,7 +435,7 @@ async def on_message(message):
         
         url, titulo = await get_audio_url(query)
         if not url:
-            await message.reply("não consegui carregar esse áudio do youtube.")
+            await message.reply("estou configurando o sistema ou o link é inválido. olhe os logs do console se for a primeira execução.")
             return
 
         if guild_id not in filas_musica: filas_musica[guild_id] = []
