@@ -1,6 +1,5 @@
 FROM python:3.11-slim
 
-# Instala ffmpeg, codecs de áudio do Opus e ferramentas essenciais de sistema
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     libopus0 \
