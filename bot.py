@@ -243,8 +243,13 @@ YTDL_OPTS = {
     "no_warnings": True,
     "default_search": "ytsearch",
     "source_address": "0.0.0.0",
-    # Simula um iPhone para contornar restrições de DRM/Região
-    "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+    # Mude para um User-Agent de navegador real atualizado
+    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "nocheckcertificate": True,
+    # O "geo_bypass" ajuda a evitar bloqueios por IP de datacenter
+    "geo_bypass": True,
+    # Isso evita que o yt-dlp tente usar cookies automaticamente
+    "cookies": None, 
 }
 
 FFMPEG_OPTS = {
