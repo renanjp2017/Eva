@@ -6,12 +6,13 @@ import asyncio
 import os
 import json
 import yt_dlp
+import logging
 
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 # ─────────────────────────────────────────────────────────────
-# ENV
+# LOAD ENV
 # ─────────────────────────────────────────────────────────────
 
 load_dotenv()
@@ -19,9 +20,14 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GROK_API_KEY = os.getenv("GROK_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")
+
+# ─────────────────────────────────────────────────────────────
+# LOGS
+# ─────────────────────────────────────────────────────────────
+
+logging.getLogger("discord.voice_state").setLevel(logging.ERROR)
 
 # ─────────────────────────────────────────────────────────────
 # DISCORD
@@ -34,23 +40,11 @@ intents.voice_states = True
 client = discord.Client(intents=intents)
 
 # ─────────────────────────────────────────────────────────────
-# OPUS
-# ─────────────────────────────────────────────────────────────
-
-try:
-    if not discord.opus.is_loaded():
-        discord.opus.load_opus("libopus.so.0")
-
-    print("OPUS OK")
-
-except Exception as e:
-    print(f"ERRO OPUS: {e}")
-
-# ─────────────────────────────────────────────────────────────
 # MEMÓRIA
 # ─────────────────────────────────────────────────────────────
 
 MEMORIA_FILE = "memoria.json"
+
 
 def carregar_memoria():
     try:
@@ -59,14 +53,16 @@ def carregar_memoria():
     except:
         return {}
 
+
 def salvar_memoria():
     with open(MEMORIA_FILE, "w", encoding="utf-8") as f:
         json.dump(memoria, f, ensure_ascii=False, indent=2)
 
+
 memoria = carregar_memoria()
 
 # ─────────────────────────────────────────────────────────────
-# ESTADO
+# ESTADO EMOCIONAL
 # ─────────────────────────────────────────────────────────────
 
 estado_atual = {
@@ -85,7 +81,9 @@ EVENTOS_ALEATORIOS = [
     ("tédio extremo", "entediada demais", 45),
     ("dor de cabeça", "grossa", 90),
     ("ressaca leve", "de ressaca", 120),
+    ("TPM", "irritadíssima", 480),
 ]
+
 
 def humor_pela_hora():
     hora = datetime.now().hour
@@ -110,24 +108,33 @@ def humor_pela_hora():
 
     return random.choice(["agitada", "rolando na cama"])
 
+
 def atualizar_estado():
     agora = datetime.now()
 
-    if estado_atual["evento_expira"] and agora > estado_atual["evento_expira"]:
+    if (
+        estado_atual["evento_expira"]
+        and agora > estado_atual["evento_expira"]
+    ):
         estado_atual["evento"] = None
         estado_atual["evento_expira"] = None
 
     if not estado_atual["evento"] and random.random() < 0.08:
-        evento, humor_evento, duracao = random.choice(EVENTOS_ALEATORIOS)
+
+        evento, humor, duracao = random.choice(EVENTOS_ALEATORIOS)
 
         estado_atual["evento"] = evento
-        estado_atual["humor"] = humor_evento
-        estado_atual["evento_expira"] = agora + timedelta(minutes=duracao)
+        estado_atual["humor"] = humor
+        estado_atual["evento_expira"] = (
+            agora + timedelta(minutes=duracao)
+        )
 
     elif not estado_atual["evento"]:
         estado_atual["humor"] = humor_pela_hora()
 
+
 def descrever_estado():
+
     hora = datetime.now().hour
 
     periodo = (
@@ -136,11 +143,16 @@ def descrever_estado():
         "de manhã" if hora < 12 else
         "na hora do almoço" if hora < 14 else
         "de tarde" if hora < 18 else
-        "de noite"
+        "de noite" if hora < 22 else
+        "de madrugada"
     )
 
     if estado_atual["evento"]:
-        return f"{periodo}, humor: {estado_atual['humor']}"
+        return (
+            f"{periodo}, humor: "
+            f"{estado_atual['humor']} "
+            f"(motivo: {estado_atual['evento']})"
+        )
 
     return f"{periodo}, humor: {estado_atual['humor']}"
 
@@ -150,11 +162,15 @@ def descrever_estado():
 
 cooldowns = {}
 
+
 def em_cooldown(user_id):
+
     agora = datetime.now()
 
-    if user_id in cooldowns and agora < cooldowns[user_id]:
-        return True
+    if user_id in cooldowns:
+
+        if agora < cooldowns[user_id]:
+            return True
 
     cooldowns[user_id] = agora + timedelta(seconds=3)
 
@@ -164,48 +180,83 @@ def em_cooldown(user_id):
 # MEMÓRIA USUÁRIO
 # ─────────────────────────────────────────────────────────────
 
+
 def get_usuario(user_id):
+
     uid = str(user_id)
 
     if uid not in memoria:
+
         memoria[uid] = {
             "nome": None,
+            "assuntos": [],
+            "fatos": [],
             "historico": [],
             "total_msgs": 0,
         }
 
     return memoria[uid]
 
-def atualizar_memoria_usuario(user_id, texto_usuario, resposta):
+
+def atualizar_memoria_usuario(user_id, texto, resposta):
+
     u = get_usuario(user_id)
 
     u["total_msgs"] += 1
 
-    u["historico"].append(f"U:{texto_usuario}")
+    u["historico"].append(f"U:{texto}")
     u["historico"].append(f"E:{resposta}")
 
     if len(u["historico"]) > 30:
         u["historico"] = u["historico"][-30:]
 
+
 def montar_contexto_usuario(user_id):
+
     u = get_usuario(user_id)
 
-    total = u.get("total_msgs", 0)
+    partes = []
 
-    if total < 5:
-        return "pessoa nova"
+    if u["nome"]:
+        partes.append(f"nome: {u['nome']}")
 
-    elif total < 20:
-        return "já conversaram algumas vezes"
+    total = u["total_msgs"]
 
-    return "fala bastante com a Eva"
+    if total == 0:
+        partes.append("primeira conversa")
+
+    elif total < 10:
+        partes.append("já conversaram")
+
+    else:
+        partes.append("fala bastante com a Eva")
+
+    return " | ".join(partes)
 
 # ─────────────────────────────────────────────────────────────
-# BUSCA
+# PESQUISA
 # ─────────────────────────────────────────────────────────────
+
+
+def deve_buscar(texto):
+
+    gatilhos = [
+        "o que é",
+        "quem é",
+        "como funciona",
+        "me fala sobre",
+        "notícia",
+        "resultado",
+        "placar"
+    ]
+
+    return any(g in texto.lower() for g in gatilhos)
+
 
 def buscar_duckduckgo(query):
+
     try:
+
         url = "https://api.duckduckgo.com/"
 
         params = {
@@ -215,44 +266,45 @@ def buscar_duckduckgo(query):
             "skip_disambig": 1
         }
 
-        r = requests.get(url, params=params, timeout=8)
+        r = requests.get(
+            url,
+            params=params,
+            timeout=8
+        )
 
         data = r.json()
 
         if data.get("AbstractText"):
             return data["AbstractText"][:400]
 
+        return None
+
     except Exception as e:
         print(f"ERRO BUSCA: {e}")
-
-    return None
-
-def deve_buscar(texto):
-    gatilhos = [
-        "o que é",
-        "quem é",
-        "notícia",
-        "resultado",
-        "placar",
-        "lançou"
-    ]
-
-    return any(g in texto.lower() for g in gatilhos)
+        return None
 
 # ─────────────────────────────────────────────────────────────
-# MÚSICA
+# YTDLP
 # ─────────────────────────────────────────────────────────────
 
 filas_musica = {}
 voice_clients = {}
 
 YTDL_OPTS = {
-    "format": "bestaudio/best",
+    "format": "bestaudio[ext=m4a]/bestaudio/best",
     "quiet": True,
     "no_warnings": True,
-    "default_search": "scsearch",
+    "default_search": "ytsearch",
     "source_address": "0.0.0.0",
     "extract_flat": False,
+    "nocheckcertificate": True,
+    "ignoreerrors": True,
+
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["android"]
+        }
+    }
 }
 
 FFMPEG_OPTS = {
@@ -264,30 +316,40 @@ FFMPEG_OPTS = {
     "options": "-vn"
 }
 
+
 async def get_audio_url(query):
+
     try:
+
         with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
 
             info = await asyncio.to_thread(
                 lambda: ydl.extract_info(
-                    f"scsearch:{query}",
+                    f"ytsearch1:{query}",
                     download=False
                 )
             )
 
-            if "entries" in info and info["entries"]:
+            if not info:
+                return None, None
 
+            if "entries" in info:
                 entry = info["entries"][0]
+            else:
+                entry = info
 
-                return (
-                    entry["url"],
-                    entry.get("title", query)
-                )
+            if not entry:
+                return None, None
+
+            return (
+                entry.get("url"),
+                entry.get("title", query)
+            )
 
     except Exception as e:
         print(f"ERRO YTDLP: {e}")
+        return None, None
 
-    return None, None
 
 async def tocar_proxima(guild_id):
 
@@ -295,6 +357,14 @@ async def tocar_proxima(guild_id):
         return
 
     if not filas_musica[guild_id]:
+
+        vc = voice_clients.get(guild_id)
+
+        if vc and vc.is_connected():
+            await vc.disconnect()
+
+        voice_clients.pop(guild_id, None)
+
         return
 
     vc = voice_clients.get(guild_id)
@@ -311,20 +381,14 @@ async def tocar_proxima(guild_id):
 
         if error:
             print(f"ERRO MUSICA: {error}")
-            return
 
-        future = asyncio.run_coroutine_threadsafe(
+        asyncio.run_coroutine_threadsafe(
             tocar_proxima(guild_id),
             client.loop
         )
 
-        try:
-            future.result()
-
-        except Exception as e:
-            print(f"ERRO NEXT: {e}")
-
     try:
+
         source = discord.FFmpegPCMAudio(
             url,
             executable="ffmpeg",
@@ -339,13 +403,13 @@ async def tocar_proxima(guild_id):
 
     except Exception as e:
         print(f"ERRO PLAYBACK: {e}")
-
         return None
+
 
 async def entrar_canal_voz(message):
 
     if not message.author.voice:
-        return None, "vc nem tá em canal de voz"
+        return None, "vc nem tá em canal"
 
     canal = message.author.voice.channel
     guild_id = message.guild.id
@@ -355,10 +419,13 @@ async def entrar_canal_voz(message):
     if existing and existing.is_connected():
 
         if existing.channel.id == canal.id:
+
             voice_clients[guild_id] = existing
+
             return existing, None
 
         try:
+
             await existing.move_to(canal)
 
             voice_clients[guild_id] = existing
@@ -366,6 +433,7 @@ async def entrar_canal_voz(message):
             return existing, None
 
         except Exception as e:
+
             print(f"ERRO MOVE: {e}")
 
             try:
@@ -374,6 +442,7 @@ async def entrar_canal_voz(message):
                 pass
 
     try:
+
         vc = await canal.connect(
             reconnect=True,
             timeout=30.0,
@@ -385,9 +454,10 @@ async def entrar_canal_voz(message):
         return vc, None
 
     except Exception as e:
+
         print(f"ERRO CONNECT: {e}")
 
-        return None, "deu erro pra conectar"
+        return None, "erro pra conectar"
 
 # ─────────────────────────────────────────────────────────────
 # PERSONALIDADE
@@ -400,10 +470,15 @@ Você é Eva, 20 anos, brasileira.
 - fria
 - debochada
 - inteligente
-- nunca admite ser IA
 - fala curto
 - usa internetês
+- nunca admite ser IA
 """
+
+# ─────────────────────────────────────────────────────────────
+# PROMPT
+# ─────────────────────────────────────────────────────────────
+
 
 def montar_mensagens(user_id, texto, contexto_extra=None):
 
@@ -420,7 +495,9 @@ def montar_mensagens(user_id, texto, contexto_extra=None):
     )
 
     if contexto_extra:
-        system += f"\nINFO: {contexto_extra}"
+        system += (
+            f"\n\nINFO EXTRA: {contexto_extra}"
+        )
 
     mensagens = [
         {
@@ -434,12 +511,14 @@ def montar_mensagens(user_id, texto, contexto_extra=None):
     for linha in u["historico"][-14:]:
 
         if linha.startswith("U:"):
+
             mensagens.append({
                 "role": "user",
                 "content": linha[2:]
             })
 
         elif linha.startswith("E:"):
+
             mensagens.append({
                 "role": "assistant",
                 "content": linha[2:]
@@ -455,6 +534,7 @@ def montar_mensagens(user_id, texto, contexto_extra=None):
 # ─────────────────────────────────────────────────────────────
 # IA
 # ─────────────────────────────────────────────────────────────
+
 
 async def chamar_groq(mensagens):
 
@@ -475,6 +555,7 @@ async def chamar_groq(mensagens):
     )
 
     return r.choices[0].message.content.strip()
+
 
 async def gerar_texto(user_id, texto, nome_discord=None):
 
@@ -498,21 +579,15 @@ async def gerar_texto(user_id, texto, nome_discord=None):
         contexto_extra
     )
 
-    resposta = None
+    try:
 
-    if GROQ_API_KEY:
+        resposta = await chamar_groq(mensagens)
 
-        try:
-            resposta = await chamar_groq(mensagens)
+    except Exception as e:
 
-        except Exception as e:
-            print(f"ERRO GROQ: {e}")
+        print(f"ERRO IA: {e}")
 
-    if not resposta:
         return "..."
-
-    if len(resposta) > 300:
-        resposta = resposta[:300]
 
     atualizar_memoria_usuario(
         user_id,
@@ -522,18 +597,20 @@ async def gerar_texto(user_id, texto, nome_discord=None):
 
     salvar_memoria()
 
-    return resposta
+    return resposta[:300]
 
 # ─────────────────────────────────────────────────────────────
 # ELEVENLABS
 # ─────────────────────────────────────────────────────────────
 
+
 def gerar_audio(texto):
 
     try:
+
         url = (
-            "https://api.elevenlabs.io/v1/text-to-speech/"
-            f"{ELEVENLABS_VOICE_ID}"
+            "https://api.elevenlabs.io/v1/"
+            f"text-to-speech/{ELEVENLABS_VOICE_ID}"
         )
 
         headers = {
@@ -563,18 +640,24 @@ def gerar_audio(texto):
 
         print(f"ERRO ELEVENLABS: {r.text}")
 
+        return None
+
     except Exception as e:
+
         print(f"ERRO AUDIO: {e}")
 
-    return None
+        return None
 
 # ─────────────────────────────────────────────────────────────
-# EVENTS
+# DISCORD EVENTS
 # ─────────────────────────────────────────────────────────────
+
 
 @client.event
 async def on_ready():
+
     print(f"Eva online como {client.user}")
+
 
 @client.event
 async def on_message(message):
@@ -598,7 +681,10 @@ async def on_message(message):
 
     if texto.startswith("eva/play "):
 
-        query = texto.replace("eva/play ", "").strip()
+        query = texto.replace(
+            "eva/play ",
+            ""
+        ).strip()
 
         vc, erro = await entrar_canal_voz(message)
 
@@ -609,7 +695,9 @@ async def on_message(message):
         url, titulo = await get_audio_url(query)
 
         if not url:
-            await message.reply("n achei")
+            await message.reply(
+                "youtube bloqueou essa música"
+            )
             return
 
         if guild_id not in filas_musica:
@@ -652,10 +740,10 @@ async def on_message(message):
 
             vc.stop()
 
-            await message.reply("ok")
+            await message.reply("skipado")
 
         else:
-            await message.reply("n tô tocando nada")
+            await message.reply("n tem nada tocando")
 
         return
 
@@ -675,7 +763,7 @@ async def on_message(message):
 
             voice_clients.pop(guild_id, None)
 
-            await message.reply("ok")
+            await message.reply("parei")
 
         return
 
@@ -688,20 +776,17 @@ async def on_message(message):
         fila = filas_musica.get(guild_id, [])
 
         if not fila:
-
             await message.reply("fila vazia")
+            return
 
-        else:
+        lista = "\n".join([
+            f"{i+1}. {t}"
+            for i, (_, t) in enumerate(fila[:10])
+        ])
 
-            lista = "\n".join([
-                f"{i+1}. {t}"
-                for i, (_, t)
-                in enumerate(fila[:10])
-            ])
-
-            await message.reply(
-                f"```\n{lista}\n```"
-            )
+        await message.reply(
+            f"```\n{lista}\n```"
+        )
 
         return
 
@@ -762,6 +847,15 @@ async def on_message(message):
 
         else:
             await message.reply(resposta)
+
+# ─────────────────────────────────────────────────────────────
+# OPUS
+# ─────────────────────────────────────────────────────────────
+
+try:
+    discord.opus.load_opus("libopus.so.0")
+except:
+    print("OPUS NÃO ENCONTRADO")
 
 # ─────────────────────────────────────────────────────────────
 # RUN
