@@ -234,7 +234,7 @@ def montar_contexto_usuario(user_id):
     return " | ".join(partes)
 
 # ─────────────────────────────────────────────────────────────
-# PESQUISA (MUDADO PARA AIOHTTP ASSÍNCRONO)
+# PESQUISA
 # ─────────────────────────────────────────────────────────────
 
 
@@ -765,10 +765,8 @@ async def on_message(message):
             for i, (_, t) in enumerate(fila[:10])
         ])
 
-        await message.reply(
-            f"```\n{lista}\n
-```"
-        )
+        await message.reply(f"```\n{lista}\n
+```")
 
         return
 
