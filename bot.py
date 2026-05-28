@@ -52,7 +52,6 @@ def carregar_memoria():
         return {}
 
 async def salvar_memoria_async():
-    # Roda a função síncrona de I/O em uma thread separada para não bloquear
     def _salvar():
         with open(MEMORIA_FILE, "w", encoding="utf-8") as f:
             json.dump(memoria, f, ensure_ascii=False, indent=2)
@@ -171,7 +170,7 @@ def montar_contexto_usuario(user_id):
     return " | ".join(partes)
 
 # ─────────────────────────────────────────────────────────────
-# PESQUISA (Agora Assíncrona com aiohttp)
+# PESQUISA
 # ─────────────────────────────────────────────────────────────
 
 def deve_buscar(texto):
@@ -209,14 +208,13 @@ YTDL_OPTS = {
     "extract_flat": False,
     "nocheckcertificate": True,
     "ignoreerrors": True,
-    "cookiefile": "cookies.txt",  # Aqui ele vai ler o arquivo que você exportou
+    "cookiefile": "cookies.txt",
     "extractor_args": {
         "youtube": {
-            "player_client": ["tv", "web"] # 'tv' tem menos chance de ser bloqueado
+            "player_client": ["tv", "web"]
         }
     }
 }
-
 
 FFMPEG_OPTS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
@@ -267,26 +265,35 @@ async def entrar_canal_voz(message):
     guild_id = message.guild.id
     existing = message.guild.voice_client
 
-    if existing and existing.is_connected():
-        if existing.channel.id == canal.id:
+    if existing:
+        # Se já está no canal certo e operando de forma saudável
+        if existing.is_connected() and existing.channel.id == canal.id:
             voice_clients[guild_id] = existing
             return existing, None
+        
+        # Se está em outro canal, tenta mover de forma limpa
+        if existing.is_connected():
+            try:
+                await existing.move_to(canal)
+                voice_clients[guild_id] = existing
+                return existing, None
+            except Exception as e:
+                print(f"ERRO MOVE: {e}")
+
+        # Se a conexão existente está instável ou em estado zumbi, limpa completamente
         try:
-            await existing.move_to(canal)
-            voice_clients[guild_id] = existing
-            return existing, None
-        except Exception as e:
-            print(f"ERRO MOVE: {e}")
-            try: await existing.disconnect(force=True)
-            except: pass
+            await existing.disconnect(force=True)
+        except: pass
+        await asyncio.sleep(0.5)
 
     try:
-        vc = await canal.connect(reconnect=True, timeout=30.0, self_deaf=True)
+        # Timeout reduzido para evitar prender o bot em handshakes infinitos se a rede falhar
+        vc = await canal.connect(reconnect=True, timeout=15.0, self_deaf=True)
         voice_clients[guild_id] = vc
         return vc, None
     except Exception as e:
-        print(f"ERRO CONNECT: {e}")
-        return None, "erro pra conectar"
+        print(f"ERRO CRÍTICO VOZ CONNECT: {e}")
+        return None, "não consegui sincronizar com o canal de voz por instabilidade na rede"
 
 # ─────────────────────────────────────────────────────────────
 # PERSONALIDADE
@@ -362,7 +369,7 @@ async def gerar_texto(user_id, texto, nome_discord=None):
     return resposta[:300]
 
 # ─────────────────────────────────────────────────────────────
-# ELEVENLABS (Agora Assíncrono com aiohttp)
+# ELEVENLABS
 # ─────────────────────────────────────────────────────────────
 
 async def gerar_audio(texto):
@@ -430,7 +437,10 @@ async def on_message(message):
         else:
             filas_musica[guild_id].insert(0, (url, titulo))
             tocando = await tocar_proxima(guild_id)
-            await message.reply(f"tocando: {tocando}")
+            if tocando:
+                await message.reply(f"tocando: {tocando}")
+            else:
+                await message.reply("tive um problema para reproduzir essa faixa.")
         return
 
     # SKIP
@@ -474,7 +484,7 @@ async def on_message(message):
         resposta = await gerar_texto(message.author.id, texto_limpo, message.author.display_name)
 
         if texto.startswith("evac/"):
-            audio = await gerar_audio(resposta)  # Agora usando await
+            audio = await gerar_audio(resposta)
             if audio:
                 arquivo = discord.File(fp=audio, filename="eva.mp3")
                 await message.reply(content=resposta, file=arquivo)
@@ -483,7 +493,7 @@ async def on_message(message):
             await message.reply(resposta)
 
 # ─────────────────────────────────────────────────────────────
-# OPUS
+# OPUS LOCAL LOAD
 # ─────────────────────────────────────────────────────────────
 
 try:
