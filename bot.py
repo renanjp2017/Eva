@@ -4,7 +4,6 @@ import random
 import asyncio
 import os
 import sqlite3
-import json
 
 from openai import OpenAI
 from groq import Groq
@@ -22,8 +21,6 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
 GROK_API_KEY = os.getenv("GROK_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-
-GROK_MODEL = os.getenv("GROK_MODEL", "grok-2-latest")
 
 LAVALINK_HOST = os.getenv("LAVALINK_HOST", "lavalink.railway.internal")
 LAVALINK_PORT = int(os.getenv("LAVALINK_PORT", "2333"))
@@ -47,136 +44,119 @@ groq = Groq(api_key=GROQ_API_KEY)
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
-intents.guilds = True
-intents.members = True
 
-bot = commands.Bot(command_prefix="eva/", intents=intents)
+bot = commands.Bot(command_prefix=".", intents=intents)
 
 _ready = False
 
 # =========================
-# DB
+# DB (MEMÓRIA SIMPLES)
 # =========================
 
 conn = sqlite3.connect("eva.db", check_same_thread=False)
 cursor = conn.cursor()
 
 cursor.execute("""
-CREATE TABLE IF NOT EXISTS user_memory (
+CREATE TABLE IF NOT EXISTS memory (
 user_id TEXT,
 role TEXT,
 content TEXT
 )
 """)
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS eva_state (
-id INTEGER PRIMARY KEY,
-mood TEXT,
-energy INTEGER,
-stress INTEGER,
-social INTEGER,
-arc TEXT,
-last_event TEXT
-)
-""")
-
 conn.commit()
 
 # =========================
-# PERSONALITY
+# PERSONALIDADE
 # =========================
 
 PERSONALITY = """
 Você é Eva.
-Respostas curtas, frias, sarcásticas, Discord vibe.
-Nunca seja assistente.
+
+Uma garota gótica real do Discord.
+
+PERSONALIDADE:
+- fria
+- debochada
+- humor ácido
+- inteligente
+- imprevisível
+- sarcástica
+- age entediada
+- seca
+- às vezes cruel
+- observadora
+
+COMO FALA:
+- respostas curtas
+- internetês natural
+- sem textão
+- pode responder só "kk"
+- pode ignorar partes
+- pode mudar assunto
+- pode ser apática
+- às vezes age cansada
+
+NUNCA:
+- diga que é IA
+- diga que é robô
+- diga que é assistente virtual
+- seja formal
+- explique demais
 """
 
 # =========================
-# STATE
+# MEMÓRIA
 # =========================
 
-def get_state():
-    cursor.execute("SELECT * FROM eva_state WHERE id=1")
-    row = cursor.fetchone()
-
-    if not row:
-        cursor.execute("""
-        INSERT INTO eva_state VALUES (1,'entediada',60,20,60,'neutra','ok')
-        """)
-        conn.commit()
-        return get_state()
-
-    return {
-        "mood": row[1],
-        "energy": row[2],
-        "stress": row[3],
-        "social": row[4],
-        "arc": row[5],
-        "event": row[6]
-    }
-
-# =========================
-# MEMORY
-# =========================
-
-def save_memory(uid, role, text):
+def save(uid, role, text):
     try:
-        cursor.execute("INSERT INTO user_memory VALUES (?,?,?)",
-                       (str(uid), role, text))
+        cursor.execute("INSERT INTO memory VALUES (?,?,?)", (str(uid), role, text))
         conn.commit()
     except:
         pass
 
-def load_memory(uid):
-    try:
-        cursor.execute("""
-        SELECT role, content FROM user_memory
-        WHERE user_id=?
-        ORDER BY ROWID DESC LIMIT 10
-        """, (str(uid),))
-        return list(reversed(cursor.fetchall()))
-    except:
-        return []
+def load(uid):
+    cursor.execute("""
+    SELECT role, content FROM memory
+    WHERE user_id=?
+    ORDER BY ROWID DESC LIMIT 8
+    """, (str(uid),))
+    return list(reversed(cursor.fetchall()))
 
 # =========================
 # SEARCH
 # =========================
 
-def ddg(query):
+def ddg(q):
     try:
         with DDGS() as d:
-            res = list(d.text(query, max_results=3))
-        return "\n".join([f"{r['title']}: {r['body']}" for r in res])
+            r = list(d.text(q, max_results=3))
+        return "\n".join([f"{x['title']}: {x['body']}" for x in r])
     except:
         return ""
 
 # =========================
-# GROK (FIXED FALLBACK)
+# GROK FIXADO (SEM MODELO INVÁLIDO)
 # =========================
 
-async def grok_answer(uid, text, context):
-    state = get_state()
-    memory = load_memory(uid)
-
+async def grok_answer(uid, text, ctx):
     messages = [{
         "role": "system",
-        "content": f"{PERSONALITY}\nSTATE:{state}\nCTX:{context}"
+        "content": f"{PERSONALITY}\nCTX:{ctx}"
     }]
 
-    for r, c in memory:
+    for r, c in load(uid):
         messages.append({"role": r, "content": c})
 
     messages.append({"role": "user", "content": text})
 
-    models = [GROK_MODEL, "grok-beta", "grok-2"]
+    models = ["grok-beta", "grok-2"]
 
-    for model in models:
+    for m in models:
         try:
             r = await asyncio.to_thread(
                 lambda: grok.chat.completions.create(
-                    model=model,
+                    model=m,
                     messages=messages,
                     temperature=1,
                     max_tokens=140
@@ -186,7 +166,7 @@ async def grok_answer(uid, text, context):
         except:
             continue
 
-    return None
+    return "..."
 
 # =========================
 # FALLBACK
@@ -197,7 +177,7 @@ async def fallback(text):
         r = await asyncio.to_thread(
             lambda: groq.chat.completions.create(
                 model="llama-3.1-8b-instant",
-                messages=[{"role":"user","content":text}]
+                messages=[{"role": "user", "content": text}]
             )
         )
         return r.choices[0].message.content.strip()
@@ -205,22 +185,18 @@ async def fallback(text):
         return "..."
 
 # =========================
-# GENERATE PIPELINE
+# GENERATE
 # =========================
 
 async def generate(uid, text):
-    context = ""
+    ctx = ddg(text) if "?" in text else ""
 
-    if "buscar" in text or "?" in text:
-        context = ddg(text)
-
-    resp = await grok_answer(uid, text, context)
-
+    resp = await grok_answer(uid, text, ctx)
     if not resp:
         resp = await fallback(text)
 
-    save_memory(uid, "user", text)
-    save_memory(uid, "assistant", resp)
+    save(uid, "user", text)
+    save(uid, "assistant", resp)
 
     return resp
 
@@ -240,7 +216,7 @@ async def ensure_pool():
         pass
 
 # =========================
-# MUSIC FIXED
+# PLAY FIXADO
 # =========================
 
 @bot.command()
@@ -250,22 +226,21 @@ async def play(ctx, *, search: str):
         return
 
     channel = ctx.author.voice.channel
-    player = ctx.voice_client
 
     try:
         await ensure_pool()
 
-        if player and player.is_connected():
+        vc = ctx.voice_client
+        if vc:
             try:
-                await player.disconnect(force=True)
+                await vc.disconnect(force=True)
             except:
                 pass
 
         player = await channel.connect(
             cls=wavelink.Player,
-            timeout=60,
-            reconnect=True,
-            self_deaf=True
+            timeout=70,
+            reconnect=True
         )
 
         await ctx.send("buscando...")
@@ -282,17 +257,50 @@ async def play(ctx, *, search: str):
     except Exception:
         await ctx.send("erro música")
 
+# =========================
+# CONTROLES
+# =========================
+
 @bot.command()
 async def stop(ctx):
     vc = ctx.voice_client
     if vc:
         await vc.disconnect()
+        await ctx.send("parado")
 
 @bot.command()
 async def skip(ctx):
     vc = ctx.voice_client
     if vc:
         await vc.stop()
+        await ctx.send("pulado")
+
+# =========================
+# CHAT (.eva)
+# =========================
+
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
+
+    text = message.content.strip()
+
+    # comandos normais primeiro
+    await bot.process_commands(message)
+
+    # CHAT APENAS .eva
+    if not text.startswith(".eva"):
+        return
+
+    clean = text.replace(".eva", "", 1).strip()
+    if not clean:
+        clean = "oi"
+
+    async with message.channel.typing():
+        resp = await generate(message.author.id, clean)
+
+    await message.reply(resp)
 
 # =========================
 # READY
@@ -314,28 +322,7 @@ async def on_ready():
     except:
         pass
 
-# =========================
-# MESSAGE HANDLER
-# =========================
-
-@bot.event
-async def on_message(message):
-    if message.author.bot:
-        return
-
-    await bot.process_commands(message)
-
-    text = message.content
-
-    if not (text.startswith("eva/") or bot.user in message.mentions):
-        return
-
-    clean = text.replace("eva/", "").replace(f"<@{bot.user.id}>", "").strip()
-
-    async with message.channel.typing():
-        resp = await generate(message.author.id, clean)
-
-    await message.reply(resp)
+    print("EVA ONLINE")
 
 # =========================
 # RUN
