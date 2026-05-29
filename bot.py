@@ -1,7 +1,3 @@
-# =========================================
-# EVA DISCORD BOT v2 - FIXED FOR RAILWAY
-# =========================================
-
 import discord
 import wavelink
 import random
@@ -10,7 +6,6 @@ import os
 import sqlite3
 import json
 import traceback
-import time
 
 from openai import OpenAI
 from groq import Groq
@@ -29,7 +24,6 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GROK_API_KEY = os.getenv("GROK_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# Modelo Grok primário (defina via env se necessário)
 GROK_MODEL = os.getenv("GROK_MODEL", "grok-2-latest")
 
 LAVALINK_HOST = os.getenv("LAVALINK_HOST", "lavalink.railway.internal")
@@ -91,7 +85,7 @@ last_event TEXT
 conn.commit()
 
 # =========================================
-# PERSONALIDADE
+# PERSONALIDADE (FORÇA PT-BR)
 # =========================================
 
 PERSONALITY = """
@@ -106,6 +100,7 @@ PERSONA:
 - levemente cruel
 
 REGRAS:
+- responda sempre em português
 - nunca diga que é IA
 - nunca explique demais
 - pode ignorar perguntas
@@ -175,9 +170,8 @@ def save_memory(uid, role, text):
         cursor.execute("INSERT INTO user_memory VALUES (?,?,?)",
                        (str(uid), role, text))
         conn.commit()
-    except Exception as e:
-        print("[DB SAVE MEMORY ERROR]", e)
-        traceback.print_exc()
+    except Exception:
+        pass
 
 def load_memory(uid):
     try:
@@ -187,9 +181,7 @@ def load_memory(uid):
         ORDER BY ROWID DESC LIMIT 10
         """, (str(uid),))
         return list(reversed(cursor.fetchall()))
-    except Exception as e:
-        print("[DB LOAD MEMORY ERROR]", e)
-        traceback.print_exc()
+    except Exception:
         return []
 
 # =========================================
@@ -201,9 +193,7 @@ def ddg(query):
         with DDGS() as d:
             res = list(d.text(query, max_results=3))
         return "\n".join([f"{r['title']}: {r['body']}" for r in res])
-    except Exception as e:
-        print("[DDG ERROR]", e)
-        traceback.print_exc()
+    except Exception:
         return ""
 
 # =========================================
@@ -244,9 +234,7 @@ JSON:
                 except:
                     pass
         return {"intent":"chat","search":False}
-    except Exception as e:
-        print("[INTENT ERROR]", e)
-        traceback.print_exc()
+    except Exception:
         return {"intent":"chat","search":False}
 
 # =========================================
@@ -275,10 +263,7 @@ CONTEXTO:
 
     messages.append({"role": "user", "content": text})
 
-    # Tenta apenas o modelo configurado em GROK_MODEL.
-    # Se falhar (modelo inexistente ou erro), retorna None para usar fallback.
     if not GROK_API_KEY:
-        print("[GROK SKIP] GROK_API_KEY not set")
         return None
 
     try:
@@ -292,10 +277,7 @@ CONTEXTO:
         )
         ans = r.choices[0].message.content.strip()
         return ans if ans else None
-    except Exception as e:
-        # Se o erro for "Model not found" ou qualquer outro, logamos e retornamos None
-        print(f"[GROK ERROR] model={GROK_MODEL} ->", e)
-        traceback.print_exc()
+    except Exception:
         return None
 
 # =========================================
@@ -313,9 +295,7 @@ async def fallback(text):
         )
         ans = r.choices[0].message.content.strip()
         return ans if ans else "..."
-    except Exception as e:
-        print("[FALLBACK ERROR]", e)
-        traceback.print_exc()
+    except Exception:
         return "..."
 
 # =========================================
@@ -347,62 +327,52 @@ async def generate(uid, text):
     return response or "..."
 
 # =========================================
-# MUSIC (WAVELINK)
+# MUSIC (WAVELINK) - estabilidade
 # =========================================
 
 async def ensure_pool_connected():
     try:
         nodes = getattr(wavelink.Pool, "nodes", None)
         if not nodes or len(nodes) == 0:
-            print("[WAVELINK] Pool vazio, criando node...")
             node = wavelink.Node(
                 uri=f"http://{LAVALINK_HOST}:{LAVALINK_PORT}",
                 password=LAVALINK_PASSWORD
             )
             await wavelink.Pool.connect(nodes=[node], client=bot)
-            await asyncio.sleep(0.5)
-            print("[WAVELINK] Pool conectado (ensure)")
-    except Exception as e:
-        print("[WAVELINK ENSURE ERROR]", e)
-        traceback.print_exc()
+            await asyncio.sleep(0.3)
+    except Exception:
+        # falha silenciosa; play tentará reconectar
+        pass
 
 @bot.command()
 async def play(ctx, *, search: str):
     if not ctx.author.voice:
-        return await ctx.send("entra na call")
+        await ctx.send("entra na call")
+        return
 
+    # Evita que o bot tente gerar texto para esse comando (on_message já ignora comandos, mas reforço)
     channel = ctx.author.voice.channel
     player = ctx.voice_client
 
     try:
         await ensure_pool_connected()
 
+        # conecta se não houver player ou não estiver conectado
         if not player or not getattr(player, "is_connected", lambda: False)():
-            try:
-                player = await channel.connect(cls=wavelink.Player)
-            except Exception as e:
-                print("[MUSIC CONNECT ERROR]", e)
-                traceback.print_exc()
-                await ensure_pool_connected()
-                player = await channel.connect(cls=wavelink.Player)
+            player = await channel.connect(cls=wavelink.Player)
 
         await ctx.send("procurando música...")
 
         tracks = await wavelink.Playable.search(search)
         if not tracks:
-            return await ctx.send("n achei")
+            await ctx.send("n achei")
+            return
 
         await player.play(tracks[0])
         await ctx.send(f"tocando: {tracks[0].title}")
 
-    except Exception as e:
-        print("[MUSIC ERROR]", e)
-        traceback.print_exc()
-        try:
-            if ctx.voice_client and ctx.voice_client.is_connected():
-                await ctx.voice_client.disconnect()
-        except:
-            pass
+    except Exception:
+        # não desconectar automaticamente aqui para evitar entrar/sair 2x
         await ctx.send("erro música")
 
 @bot.command()
@@ -446,19 +416,16 @@ async def on_ready():
         return
     _ready = True
 
-    print("EVA ONLINE - on_ready")
-
+    # tenta conectar pool; silencioso
     try:
         node = wavelink.Node(
             uri=f"http://{LAVALINK_HOST}:{LAVALINK_PORT}",
             password=LAVALINK_PASSWORD
         )
-
         await wavelink.Pool.connect(nodes=[node], client=bot)
-        print("[LAVALINK] Pool conectado")
-    except Exception as e:
-        print("[LAVALINK CONNECT ERROR]", e)
-        traceback.print_exc()
+        await asyncio.sleep(0.2)
+    except Exception:
+        pass
 
     asyncio.create_task(loop())
 
@@ -472,9 +439,8 @@ async def loop():
         await asyncio.sleep(random.randint(1800, 3600))
         try:
             update_state()
-        except Exception as e:
-            print("[LOOP ERROR]", e)
-            traceback.print_exc()
+        except Exception:
+            pass
 
 # =========================================
 # MESSAGE HANDLER
@@ -485,15 +451,25 @@ async def on_message(message):
     if message.author.bot:
         return
 
+    # processa comandos primeiro
     await bot.process_commands(message)
 
     text = message.content.strip()
 
-    if not (text.startswith("eva/") or bot.user in message.mentions):
+    # se for um comando válido (ex: eva/play), não chamar o gerador de texto
+    prefix = bot.command_prefix
+    if text.startswith(prefix):
+        # extrai o nome do comando após o prefixo
+        cmd_name = text[len(prefix):].split()[0] if len(text) > len(prefix) else ""
+        if cmd_name and bot.get_command(cmd_name):
+            return  # é um comando conhecido, já processado
+
+    # ativa se mencionar ou usar prefixo sem ser comando
+    if not (text.startswith(prefix) or bot.user in message.mentions):
         return
 
-    clean = text.replace("eva/", "").replace(f"<@{bot.user.id}>","").strip()
-
+    # limpa o texto para enviar ao gerador
+    clean = text.replace(prefix, "", 1).replace(f"<@{bot.user.id}>", "").strip()
     if not clean:
         clean = "oi"
 
@@ -501,9 +477,7 @@ async def on_message(message):
         await asyncio.sleep(1)
         try:
             resp = await generate(message.author.id, clean)
-        except Exception as e:
-            print("[GENERATE ERROR]", e)
-            traceback.print_exc()
+        except Exception:
             resp = "..."
 
     if not resp:
@@ -511,15 +485,26 @@ async def on_message(message):
 
     try:
         await message.reply(resp)
-    except Exception as e:
-        print("[REPLY ERROR]", e)
-        traceback.print_exc()
+    except Exception:
+        pass
+
+# =========================================
+# IGNORA CommandNotFound (silencioso)
+# =========================================
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CommandNotFound):
+        return
+    # outros erros são ignorados silenciosamente para não poluir logs
+    return
 
 # =========================================
 # RUN
 # =========================================
 
 if not DISCORD_TOKEN:
-    print("ERROR: DISCORD_TOKEN not set in environment")
+    # sem token, não roda
+    pass
 else:
     bot.run(DISCORD_TOKEN)
