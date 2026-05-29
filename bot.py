@@ -557,102 +557,83 @@ async def gerar_texto(user_id, texto):
 @bot.command(name="play")
 async def play(ctx, *, search: str):
 
+    # não está em call
     if not ctx.author.voice:
-
-        await ctx.send(
-            "entra em call primeiro"
-        )
-
+        await ctx.send("entra em call primeiro")
         return
 
     canal = ctx.author.voice.channel
 
-    player: wavelink.Player = ctx.voice_client
+    player = ctx.voice_client
 
-    if player is None:
-
+    # conecta ou reconecta corretamente
+    if not player or not getattr(player, "is_connected", lambda: False)():
         try:
-
-            player = await canal.connect(
-                cls=wavelink.Player
-            )
-
+            player = await canal.connect(cls=wavelink.Player)
         except Exception as e:
-    print("VOICE ERROR:", repr(e))
-    await ctx.send(f"erro voice: {repr(e)}")
+            print("VOICE ERROR:", repr(e))
+            await ctx.send(f"erro voice: {repr(e)}")
             return
 
     await ctx.send("procurando música...")
 
     try:
-
         tracks = await wavelink.Playable.search(search)
 
         if not tracks:
-
             await ctx.send("n achei isso")
-
             return
 
         track = tracks[0]
 
         await player.play(track)
 
-        await ctx.send(
-            f"tocando: {track.title}"
-        )
+        await ctx.send(f"tocando: {track.title}")
 
     except Exception as e:
-
-        print(e)
-
+        print("PLAY ERROR:", repr(e))
         await ctx.send("lavalink surtou")
 
 
 @bot.command(name="stop")
 async def stop(ctx):
 
-    player: wavelink.Player = ctx.voice_client
+    player = ctx.voice_client
 
-    if player:
-
+    if player and player.is_connected():
         await player.disconnect()
-
         await ctx.send("silêncio finalmente")
 
 
 @bot.command(name="skip")
 async def skip(ctx):
 
-    player: wavelink.Player = ctx.voice_client
+    player = ctx.voice_client
 
-    if player:
-
+    if player and player.is_connected():
         await player.stop()
-
         await ctx.send("pulada")
 
 
 @bot.command(name="pause")
 async def pause(ctx):
 
-    player: wavelink.Player = ctx.voice_client
+    player = ctx.voice_client
 
-    if player and player.playing:
+    if player and player.is_connected() and player.playing:
 
         await player.pause(not player.paused)
 
         estado = "pausada" if player.paused else "voltou"
-
         await ctx.send(estado)
 
 
 @bot.command(name="volume")
 async def volume(ctx, vol: int):
 
-    player: wavelink.Player = ctx.voice_client
+    player = ctx.voice_client
 
-    if player:
+    if player and player.is_connected():
 
         vol = max(0, min(100, vol))
 
