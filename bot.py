@@ -578,12 +578,8 @@ async def play(ctx, *, search: str):
             )
 
         except Exception as e:
-
-            print(e)
-
-            await ctx.send(
-                "n consegui entrar na call"
-            )
+    print("VOICE ERROR:", repr(e))
+    await ctx.send(f"erro voice: {repr(e)}")
 
             return
 
