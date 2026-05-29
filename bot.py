@@ -1,4 +1,3 @@
-cat > /mnt/user-data/outputs/bot.py << 'BOTEOF'
 import discord
 import io
 import re
@@ -566,5 +565,3 @@ try: discord.opus.load_opus("libopus.so.0")
 except: pass
 
 client.run(DISCORD_TOKEN)
-BOTEOF
-echo "ok"
