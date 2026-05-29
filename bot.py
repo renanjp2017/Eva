@@ -704,7 +704,26 @@ async def on_message(message):
     if message.author.bot:
         return
 
+    # deixa comandos funcionarem primeiro
+    await bot.process_commands(message)
+
     texto = message.content.strip()
+
+    # ignora comandos reais
+    if texto.startswith("eva/play"):
+        return
+
+    if texto.startswith("eva/stop"):
+        return
+
+    if texto.startswith("eva/skip"):
+        return
+
+    if texto.startswith("eva/pause"):
+        return
+
+    if texto.startswith("eva/volume"):
+        return
 
     ativar = (
         texto.startswith("eva/")
@@ -724,7 +743,6 @@ async def on_message(message):
         )
 
         if texto_limpo == "":
-
             texto_limpo = "oi"
 
         async with message.channel.typing():
@@ -733,27 +751,15 @@ async def on_message(message):
                 random.uniform(0.8, 2.5)
             )
 
-            if random.random() < 0.03:
-                return
-
             resposta = await gerar_texto(
                 message.author.id,
                 texto_limpo
             )
 
             try:
-
-                await message.reply(
-                    resposta
-                )
-
+                await message.reply(resposta)
             except:
                 pass
-
-    await bot.process_commands(
-        message
-    )
-
 # =========================================
 # RUN
 # =========================================
