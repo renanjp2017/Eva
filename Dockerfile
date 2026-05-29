@@ -1,22 +1,26 @@
+# Use Python 3.11 slim
 FROM python:3.11-slim
 
-RUN apt-get update && apt-get install -y \
-    gcc \
-    libffi-dev \
-    libsodium-dev \
-    libopus-dev \
-    python3-dev \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+# Evita buffering de logs
+ENV PYTHONUNBUFFERED=1
 
+# Diretório da aplicação
 WORKDIR /app
 
-COPY requirements.txt .
+# Instala dependências do sistema necessárias (ffmpeg para audio)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ffmpeg build-essential && \
+    rm -rf /var/lib/apt/lists/*
 
-RUN pip uninstall -y discord discord.py
-RUN pip install --no-cache-dir PyNaCl
-RUN pip install --no-cache-dir -r requirements.txt
+# Copia requirements e instala
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
-COPY . .
+# Copia o código
+COPY . /app
 
+# Porta exposta (opcional)
+EXPOSE 8080
+
+# Comando padrão
 CMD ["python", "bot.py"]
