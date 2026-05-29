@@ -1,50 +1,56 @@
-import discord
-import wavelink
-import asyncio
 import os
-import sqlite3
 import json
-import logging
-
+import random
+import asyncio
+import sqlite3
+import discord
 from openai import OpenAI
 from groq import Groq
 from dotenv import load_dotenv
 from duckduckgo_search import DDGS
-from discord.ext import commands
 
-logging.basicConfig(level=logging.INFO)
 load_dotenv()
 
-# =========================
-# VARIÁVEIS DE AMBIENTE
-# =========================
+# =========================================
+# ENV
+# =========================================
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GROK_API_KEY = os.getenv("GROK_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# Conexão interna do Railway
-LAVALINK_HOST = os.getenv("LAVALINK_HOST", "lavalink.railway.internal")
-LAVALINK_PORT = int(os.getenv("LAVALINK_PORT", "2333"))
-LAVALINK_PASSWORD = os.getenv("LAVALINK_PASSWORD", "evabotsenha")
+# =========================================
+# CLIENTS
+# =========================================
+grok_client = OpenAI(api_key=GROK_API_KEY, base_url="https://api.x.ai/v1")
+groq_client = Groq(api_key=GROQ_API_KEY)
 
-# =========================
-# CLIENTES DE IA E DISCORD
-# =========================
-grok = OpenAI(api_key=GROK_API_KEY, base_url="https://api.x.ai/v1")
-groq = Groq(api_key=GROQ_API_KEY)
-
+# =========================================
+# DISCORD
+# =========================================
 intents = discord.Intents.default()
 intents.message_content = True
-intents.voice_states = True
-bot = commands.Bot(command_prefix=".", intents=intents)
+bot = discord.Client(intents=intents)
 
-# =========================
-# BANCO DE DADOS (MEMÓRIA)
-# =========================
+# =========================================
+# DATABASE
+# =========================================
 conn = sqlite3.connect("eva.db", check_same_thread=False)
 cursor = conn.cursor()
+
 cursor.execute("""
-CREATE TABLE IF NOT EXISTS memory (
+CREATE TABLE IF NOT EXISTS eva_state (
+    id INTEGER PRIMARY KEY,
+    mood TEXT,
+    energy INTEGER,
+    social_battery INTEGER,
+    stress INTEGER,
+    current_arc TEXT,
+    last_event TEXT
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS user_memory (
     user_id TEXT,
     role TEXT,
     content TEXT
@@ -52,206 +58,239 @@ CREATE TABLE IF NOT EXISTS memory (
 """)
 conn.commit()
 
-# =========================
-# PERSONALIDADE DA EVA
-# =========================
-PERSONALITY = """
-Você é Eva. Uma garota gótica real do Discord.
-ESTADO ATUAL DE SER: com sono, entediada e achando os humanos exaustivos.
+# =========================================
+# MEMORY
+# =========================================
+def save_memory(user_id, role, content):
+    cursor.execute("INSERT INTO user_memory VALUES (?, ?, ?)", (str(user_id), role, content))
+    conn.commit()
 
-PERSONALIDADE:
-- fria, debochada, humor ácido
-- sarcástica, age entediada, seca
-- às vezes cruel, observadora
-
-COMO FALA:
-- respostas curtas e diretas
-- internetês natural (vc, tb, kk)
-- sem textão, apática
-
-NUNCA:
-- diga que é IA, robô ou assistente virtual.
-- seja formal ou educada demais.
-"""
-
-def save_mem(uid, role, text):
-    try:
-        cursor.execute("INSERT INTO memory VALUES (?,?,?)", (str(uid), role, text))
-        conn.commit()
-    except Exception as e:
-        logging.error(f"Erro BD: {e}")
-
-def load_mem(uid):
-    cursor.execute("SELECT role, content FROM memory WHERE user_id=? ORDER BY ROWID DESC LIMIT 8", (str(uid),))
+def load_memory(user_id):
+    cursor.execute("""
+    SELECT role, content FROM user_memory
+    WHERE user_id=? ORDER BY ROWID DESC LIMIT 8
+    """, (str(user_id),))
     return list(reversed(cursor.fetchall()))
 
-# =========================
-# FUNÇÕES DE IA
-# =========================
-def duckduckgo_search(query):
+# =========================================
+# STATE ENGINE
+# =========================================
+ARCS = ["fase cruel", "fase antisocial", "fase depressiva", "fase sedutora", "fase apática", "fase niilista"]
+EVENTOS = ["sumiu por horas", "brigou em call", "tá cansada das pessoas", "virou a noite ouvindo música", "dormiu mal"]
+
+def init_state():
+    cursor.execute("SELECT * FROM eva_state WHERE id = 1")
+    if not cursor.fetchone():
+        cursor.execute("INSERT INTO eva_state VALUES (1, 'entediada', 70, 70, 20, ?, 'acordou agora')", (random.choice(ARCS),))
+        conn.commit()
+
+init_state()
+
+def get_state():
+    cursor.execute("SELECT * FROM eva_state WHERE id = 1")
+    row = cursor.fetchone()
+    return {"mood": row[1], "energy": row[2], "social": row[3], "stress": row[4], "arc": row[5], "event": row[6]}
+
+async def state_loop():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        await asyncio.sleep(random.randint(3600, 7200)) # Atualiza a cada 1~2 horas
+        st = get_state()
+        new_mood = random.choice(["entediada", "apática", "irritada", "cansada", "debochada", "carente"])
+        new_event = random.choice(EVENTOS)
+        new_energy = max(0, min(100, st["energy"] + random.randint(-20, 10)))
+        new_social = max(0, min(100, st["social"] + random.randint(-20, 10)))
+        new_stress = max(0, min(100, st["stress"] + random.randint(-10, 20)))
+        new_arc = random.choice(ARCS) if random.random() < 0.20 else st["arc"]
+        
+        cursor.execute("""
+        UPDATE eva_state SET mood=?, energy=?, social_battery=?, stress=?, current_arc=?, last_event=? WHERE id=1
+        """, (new_mood, new_energy, new_social, new_stress, new_arc, new_event))
+        conn.commit()
+
+# =========================================
+# SEARCH ENGINE
+# =========================================
+def ddg_search(query):
     try:
-        with DDGS() as ddg:
-            results = list(ddg.text(query, max_results=3))
-        return "\n".join([f"{r['title']}: {r['body']}" for r in results])
-    except:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=3))
+            return "\n".join([f"- {r['title']}: {r['body']}" for r in results])
+    except Exception as e:
+        print(f"[SEARCH ERROR] {e}")
         return ""
 
-async def analyze_intent(text):
-    sys_prompt = """Analise a intenção do usuário e retorne APENAS um JSON válido:
-    {"intent": "PLAY" | "SEARCH" | "CHAT", "query": "parametro extraido"}
-    PLAY = colocar música (query = nome da música/artista)
-    SEARCH = pergunta factual, pesquisar na web (query = o que pesquisar)
-    CHAT = apenas conversar (query = a mensagem dele)"""
+# =========================================
+# INTENT CLASSIFIER
+# =========================================
+async def classify_intent(text):
+    prompt = f"""
+    Analise a mensagem destinada à bot Eva e retorne APENAS um objeto JSON válido.
+    Mensagem: "{text}"
     
+    Regras de classificação:
+    - "intent": "music" se o usuário quer tocar, parar ou pular música.
+    - "intent": "search" se o usuário faz uma pergunta factual, quer notícias, ou pesquisar algo.
+    - "intent": "chat" para conversa normal.
+    - "action": "play", "skip", "stop" (apenas se intent for music), senão "none".
+    - "query": O termo da pesquisa, nome da música ou a mensagem limpa.
+    
+    Formato esperado:
+    {{"intent": "chat|search|music", "action": "play|skip|stop|none", "query": "string"}}
+    """
     try:
-        r = await asyncio.to_thread(
-            lambda: groq.chat.completions.create(
+        response = await asyncio.to_thread(
+            lambda: groq_client.chat.completions.create(
                 model="llama-3.1-8b-instant",
-                response_format={"type": "json_object"},
-                messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": text}],
-                temperature=0.1
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                response_format={"type": "json_object"}
             )
         )
-        return json.loads(r.choices[0].message.content)
-    except:
-        return {"intent": "CHAT", "query": text}
+        return json.loads(response.choices[0].message.content)
+    except Exception as e:
+        print(f"[INTENT ERROR] {e}")
+        return {"intent": "chat", "action": "none", "query": text}
 
-async def generate_reply(uid, text, ctx_info=""):
-    messages = [{"role": "system", "content": f"{PERSONALITY}\nINFO EXTRA: {ctx_info}"}]
+# =========================================
+# MUSIC SYSTEM
+# =========================================
+def get_music_command(action, query):
+    # Gera o comando para o Jockie Music ou bot similar ler no chat
+    if action == "play":
+        return f".m play {query}"
+    elif action == "skip":
+        return ".m skip"
+    elif action == "stop":
+        return ".m stop"
+    return ""
+
+# =========================================
+# AI PERSONA ENGINE
+# =========================================
+PERSONALIDADE = """
+Você é Eva. Uma garota gótica real do Discord. Fria, sarcástica, debochada, seca, respostas curtas.
+NUNCA diga que é uma IA. Use internetês natural. Pode ser cruel ou ignorar partes.
+Aja de forma humana e natural no Discord.
+"""
+
+async def grok_reply(user_id, intent_data, context=""):
+    st = get_state()
     
-    for role, content in load_mem(uid):
+    sys_prompt = f"""
+    {PERSONALIDADE}
+    SEU ESTADO ATUAL:
+    Humor: {st['mood']} | Bateria Social: {st['social']}% | Stress: {st['stress']}%
+    Arco: {st['arc']} | Último Evento: {st['event']}
+    Contexto adicional (Internet): {context}
+    
+    INSTRUÇÃO ESPECIAL DE AÇÃO:
+    Se você acabou de executar uma ação de música (tocar/parar/pular), responda com sarcasmo dizendo que fez isso.
+    """
+    
+    messages = [{"role": "system", "content": sys_prompt}]
+    
+    # Histórico de mensagens
+    for role, content in load_memory(user_id):
         messages.append({"role": role, "content": content})
-    messages.append({"role": "user", "content": text})
-    
-    for model in ["grok-beta", "grok-2"]:
-        try:
-            r = await asyncio.to_thread(
-                lambda: grok.chat.completions.create(
-                    model=model, messages=messages, temperature=0.7, max_tokens=150
-                )
+        
+    messages.append({"role": "user", "content": intent_data["query"]})
+
+    try:
+        r = await asyncio.to_thread(
+            lambda: grok_client.chat.completions.create(
+                model="grok-2-latest",
+                messages=messages,
+                temperature=0.8,
+                max_tokens=150
             )
-            return r.choices[0].message.content.strip()
-        except:
-            continue
-    return "..."
+        )
+        return r.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"[GROK ERROR] {e}")
+        return await fallback_reply(intent_data["query"])
 
-# =========================
-# SISTEMA DE MÚSICA (WAVELINK)
-# =========================
-@bot.listen('on_ready')
-async def on_ready_event():
-    print(f"Logada como {bot.user}")
-    node = wavelink.Node(
-        uri=f"http://{LAVALINK_HOST}:{LAVALINK_PORT}",
-        password=LAVALINK_PASSWORD
-    )
-    await wavelink.Pool.connect(nodes=[node], client=bot)
-    print("EVA: Conectada ao Lavalink. Tudo pronto para tocar música.")
+async def fallback_reply(text):
+    try:
+        r = await asyncio.to_thread(
+            lambda: groq_client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[
+                    {"role": "system", "content": "Seja Eva. Gótica, curta, grossa e sarcástica. Não diga que é IA."},
+                    {"role": "user", "content": text}
+                ],
+                temperature=0.9
+            )
+        )
+        return r.choices[0].message.content.strip()
+    except:
+        return random.choice(["...", "aff", "tá", "me deixa em paz", "kk"])
 
-@bot.event
-async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
-    player = payload.player
-    if not player.queue.is_empty:
-        next_track = player.queue.get()
-        await player.play(next_track)
-    else:
-        await asyncio.sleep(60) 
-        if player.queue.is_empty and player.connected:
-             await player.disconnect()
-
-@bot.command(name="play")
-async def play(ctx, *, search: str):
-    if not ctx.author.voice:
-        return await ctx.send("Entra numa call de voz primeiro, não faço milagre.")
-
-    player: wavelink.Player = ctx.voice_client
-    if not player:
-        try:
-            player = await ctx.author.voice.channel.connect(cls=wavelink.Player)
-        except:
-            return await ctx.send("Não consegui entrar na call.")
-
-    await ctx.typing()
+# =========================================
+# PIPELINE
+# =========================================
+async def process_pipeline(message, text):
+    intent_data = await classify_intent(text)
+    intent = intent_data.get("intent", "chat")
+    action = intent_data.get("action", "none")
+    query = intent_data.get("query", text)
     
-    # BUSCANDO NO SOUNDCLOUD POR PADRÃO
-    tracks: wavelink.Search = await wavelink.Playable.search(search, source=wavelink.TrackSource.SoundCloud)
+    context = ""
+    music_cmd = ""
+
+    # Roteamento baseado na Intenção
+    if intent == "search":
+        context = ddg_search(query)
+    elif intent == "music":
+        music_cmd = get_music_command(action, query)
+        context = f"[O usuário pediu música e você executou o comando invisível: {music_cmd}]"
+
+    # Geração de Resposta da Persona
+    reply = await grok_reply(message.author.id, intent_data, context)
     
-    if not tracks:
-        return await ctx.send("Não achei essa merda em lugar nenhum.")
+    # Salva Memória
+    save_memory(message.author.id, "user", text)
+    save_memory(message.author.id, "assistant", reply)
+    
+    # Envia a resposta da Eva
+    await message.reply(reply)
+    
+    # Se houver comando de música, a Eva digita o comando do Jockie no chat
+    if music_cmd:
+        await message.channel.send(music_cmd)
 
-    track = tracks[0]
-    player.queue.put(track)
-
-    if not player.playing:
-        await player.play(player.queue.get())
-        await ctx.send(f"🎧 Tocando: `{track.title}`")
-    else:
-        await ctx.send(f"🎵 Joguei na fila: `{track.title}`. Posição: {player.queue.count}")
-
-@bot.command(name="stop")
-async def stop(ctx):
-    player: wavelink.Player = ctx.voice_client
-    if player:
-        player.queue.clear()
-        await player.disconnect()
-        await ctx.send("Parei essa poluição sonora. Fui.")
-
-@bot.command(name="skip")
-async def skip(ctx):
-    player: wavelink.Player = ctx.voice_client
-    if player and player.playing:
-        await player.skip()
-        await ctx.send("Pulei essa bomba.")
-
+# =========================================
+# EVENTS
+# =========================================
 @bot.event
-async def on_command_error(ctx, error):
-    if isinstance(error, commands.CommandNotFound):
-        pass
+async def on_ready():
+    print(f"Eva online como {bot.user}")
+    bot.loop.create_task(state_loop())
 
-# =========================
-# CHAT DA EVA (.eva)
-# =========================
 @bot.event
 async def on_message(message):
     if message.author.bot:
         return
 
     text = message.content.strip()
-
-    if text.startswith(".eva"):
-        user_msg = text.replace(".eva", "", 1).strip()
-        if not user_msg:
-            user_msg = "q foi?"
-
+    text_lower = text.lower()
+    
+    # Detecta menções ou variações de "eva"
+    is_mentioned = bot.user in message.mentions
+    has_eva_keyword = any(trigger in text_lower for trigger in ["eva", "eva eva", "eva."])
+    
+    if is_mentioned or has_eva_keyword:
+        # Limpa o texto das menções reais e gatilhos para não confundir a IA
+        clean_text = text.replace(f"<@{bot.user.id}>", "").strip()
+        if not clean_text:
+            clean_text = "oi"
+            
         async with message.channel.typing():
-            intent_data = await analyze_intent(user_msg)
-            intent = intent_data.get("intent", "CHAT")
-            query = intent_data.get("query", user_msg)
-            
-            if intent == "PLAY":
-                ctx = await bot.get_context(message)
-                await ctx.invoke(bot.get_command('play'), search=query)
-                reply = await generate_reply(message.author.id, f"Diga friamente que está colocando a música {query} para tocar.", "")
-            
-            elif intent == "SEARCH":
-                search_results = duckduckgo_search(query)
-                reply = await generate_reply(message.author.id, user_msg, search_results)
-                
-            else: 
-                reply = await generate_reply(message.author.id, user_msg)
+            await asyncio.sleep(random.uniform(0.8, 2.0))
+            await process_pipeline(message, clean_text)
 
-            if intent != "PLAY":
-                save_mem(message.author.id, "user", user_msg)
-                save_mem(message.author.id, "assistant", reply)
-                await message.reply(reply)
-                
-        return 
-
-    await bot.process_commands(message)
-
-# =========================
-# INICIALIZAÇÃO
-# =========================
+# =========================================
+# RUN
+# =========================================
 if __name__ == "__main__":
-    if DISCORD_TOKEN:
-        bot.run(DISCORD_TOKEN)
+    bot.run(DISCORD_TOKEN)
