@@ -170,12 +170,22 @@ YDL_OPTIONS = {
     "noplaylist": True,
     "quiet": True,
     "extract_flat": False,
-    "default_search": "ytsearch",
+    "default_search": "ytsearch1",
     "source_address": "0.0.0.0",
+
     "http_headers": {
         "User-Agent": (
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)"
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
         )
+    },
+
+    "extractor_args": {
+        "youtube": {
+            "player_client": [
+                "android",
+                "web"
+            ]
+        }
     }
 }
 
@@ -319,7 +329,7 @@ def geo_ip():
         return "localização desconhecida"
 
 # =========================================
-# VIDA
+# VIDA AUTOMÁTICA
 # =========================================
 
 async def vida_da_eva():
@@ -347,21 +357,24 @@ async def vida_da_eva():
 
         nova_energia = max(
             0,
-            min(100,
+            min(
+                100,
                 estado["energy"] + random.randint(-20, 10)
             )
         )
 
         nova_social = max(
             0,
-            min(100,
+            min(
+                100,
                 estado["social_battery"] + random.randint(-20, 10)
             )
         )
 
         novo_stress = max(
             0,
-            min(100,
+            min(
+                100,
                 estado["stress"] + random.randint(-10, 20)
             )
         )
@@ -605,7 +618,7 @@ async def gerar_texto(user_id, texto):
     return resposta
 
 # =========================================
-# AUDIO
+# ELEVENLABS
 # =========================================
 
 def gerar_audio(texto):
@@ -650,13 +663,16 @@ async def tocar_proxima(ctx):
     guild_id = ctx.guild.id
 
     if (
-        guild_id in music_queues
-        and len(music_queues[guild_id]) > 0
+        guild_id not in music_queues
+        or len(music_queues[guild_id]) == 0
     ):
+        return
 
-        query = music_queues[guild_id].pop(0)
+    query = music_queues[guild_id].pop(0)
 
-        voice = ctx.guild.voice_client
+    voice = ctx.guild.voice_client
+
+    try:
 
         with yt_dlp.YoutubeDL(
             YDL_OPTIONS
@@ -667,10 +683,35 @@ async def tocar_proxima(ctx):
                 download=False
             )
 
+            if not info:
+
+                await ctx.send(
+                    "n achei essa porra"
+                )
+
+                return
+
             if "entries" in info:
+
+                if len(info["entries"]) == 0:
+
+                    await ctx.send(
+                        "youtube fingiu q n existe"
+                    )
+
+                    return
+
                 info = info["entries"][0]
 
-            audio_url = info["url"]
+            audio_url = info.get("url")
+
+            if not audio_url:
+
+                await ctx.send(
+                    "youtube cagou o link"
+                )
+
+                return
 
         source = discord.FFmpegPCMAudio(
             audio_url,
@@ -684,6 +725,23 @@ async def tocar_proxima(ctx):
                 tocar_proxima(ctx),
                 bot.loop
             )
+        )
+
+        titulo = info.get(
+            "title",
+            "musica estranha"
+        )
+
+        await ctx.send(
+            f"tocando agr: {titulo}"
+        )
+
+    except Exception as e:
+
+        print(f"ERRO PLAY: {e}")
+
+        await ctx.send(
+            "youtube surtou dnv"
         )
 
 @bot.command(name="play")
@@ -718,10 +776,6 @@ async def play(ctx, *, query):
 
         await tocar_proxima(ctx)
 
-    await ctx.send(
-        f"tocando: {query}"
-    )
-
 @bot.command(name="skip")
 async def skip(ctx):
 
@@ -729,7 +783,9 @@ async def skip(ctx):
 
         ctx.voice_client.stop()
 
-        await ctx.send("skipado")
+        await ctx.send(
+            "skipado"
+        )
 
 @bot.command(name="stop")
 async def stop(ctx):
