@@ -676,10 +676,11 @@ async def on_ready():
         f"Eva online como {bot.user}"
     )
 
-    node = wavelink.Node(
-        uri=f"http://{LAVALINK_HOST}:{LAVALINK_PORT}",
-        password=LAVALINK_PASSWORD
-    )
+    # No on_ready
+node = wavelink.Node(
+    uri=f"http://{LAVALINK_HOST}:{LAVALINK_PORT}",
+    password=LAVALINK_PASSWORD
+)
 
     await wavelink.Pool.connect(
         nodes=[node],
