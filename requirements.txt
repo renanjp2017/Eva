@@ -1,8 +1,8 @@
-discord.py==2.3.2
-wavelink==2.0.0
+discord.py>=2.3.2
+wavelink>=3.4.0
 python-dotenv==1.0.0
 requests==2.31.0
-duckduckgo_search==2.6.2
-openai==1.0.0
-groq==0.1.0
-aiohttp==3.8.4
+duckduckgo_search>=5.0.0
+openai>=1.0.0
+groq>=0.4.0
+aiohttp>=3.8.4
