@@ -1,0 +1,10 @@
+server:
+  port: 2333
+
+lavalink:
+  server:
+    password: "senhaeva"
+    sources:
+      youtube: true
+      soundcloud: true
+    youtubeSearchEnabled: true
