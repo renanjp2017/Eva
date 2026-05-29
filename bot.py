@@ -1,5 +1,5 @@
 # =========================================
-# EVA DISCORD BOT (FIXED)
+# EVA DISCORD BOT - STABLE BUILD
 # =========================================
 
 import discord
@@ -19,7 +19,7 @@ from discord.ext import commands
 load_dotenv()
 
 # =========================================
-# TOKENS
+# ENV
 # =========================================
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -34,7 +34,7 @@ LAVALINK_PORT = int(os.getenv("LAVALINK_PORT", "2333"))
 LAVALINK_PASSWORD = os.getenv("LAVALINK_PASSWORD", "evabotsenha")
 
 # =========================================
-# IA
+# IA CLIENTS
 # =========================================
 
 grok = OpenAI(
@@ -45,7 +45,7 @@ grok = OpenAI(
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 # =========================================
-# DISCORD
+# DISCORD SETUP
 # =========================================
 
 intents = discord.Intents.default()
@@ -57,11 +57,16 @@ intents.members = True
 bot = commands.Bot(command_prefix="eva/", intents=intents)
 
 # =========================================
-# SQLITE SAFE MODE
+# STATE FLAGS
+# =========================================
+
+_ready_once = False
+
+# =========================================
+# DATABASE SAFE
 # =========================================
 
 conn = sqlite3.connect("eva.db", check_same_thread=False)
-conn.execute("PRAGMA journal_mode=WAL;")
 cursor = conn.cursor()
 
 cursor.execute("""
@@ -88,19 +93,18 @@ CREATE TABLE IF NOT EXISTS user_memory (
 conn.commit()
 
 # =========================================
-# PERSONALIDADE (mantida)
+# PERSONALIDADE
 # =========================================
 
-PERSONALIDADE = """Eva..."""
+PERSONALIDADE = """
+Você é Eva.
+Fria, debochada, sarcástica, curta nas respostas.
+Nunca diga que é IA.
+Nunca explique demais.
+"""
 
 # =========================================
-# SAFE STATE GUARD
-# =========================================
-
-_eva_ready = False
-
-# =========================================
-# HELPERS
+# STATE
 # =========================================
 
 def pegar_estado():
@@ -113,8 +117,8 @@ def pegar_estado():
             "energy": 50,
             "social_battery": 50,
             "stress": 20,
-            "obsession": "darkwave",
-            "arc": "fase neutra",
+            "obsession": "dark",
+            "arc": "neutra",
             "event": "acordou"
         }
 
@@ -129,19 +133,138 @@ def pegar_estado():
     }
 
 # =========================================
-# ON READY FIX
+# MEMORY
+# =========================================
+
+def salvar_memoria(user_id, role, content):
+    cursor.execute(
+        "INSERT INTO user_memory VALUES (?, ?, ?)",
+        (str(user_id), role, content)
+    )
+    conn.commit()
+
+def carregar_memoria(user_id):
+    cursor.execute(
+        "SELECT role, content FROM user_memory WHERE user_id=? ORDER BY ROWID DESC LIMIT 10",
+        (str(user_id),)
+    )
+    data = cursor.fetchall()
+    data.reverse()
+    return data
+
+# =========================================
+# DUCK SEARCH
+# =========================================
+
+def search(text):
+    try:
+        with DDGS() as ddgs:
+            res = list(ddgs.text(text, max_results=3))
+
+        out = ""
+        for r in res:
+            out += f"{r['title']}: {r['body']}\n\n"
+
+        return out
+    except:
+        return ""
+
+# =========================================
+# IA
+# =========================================
+
+async def gerar_resposta(user_id, texto):
+
+    estado = pegar_estado()
+
+    pesquisa = ""
+    gatilhos = ["quem", "o que", "onde", "quando", "noticia", "pesquisa"]
+
+    if any(g in texto.lower() for g in gatilhos):
+        pesquisa = search(texto)
+
+    mensagens = [{
+        "role": "system",
+        "content": f"{PERSONALIDADE}\nESTADO:{estado}\n{pesquisa}"
+    }]
+
+    for r, c in carregar_memoria(user_id):
+        mensagens.append({"role": r, "content": c})
+
+    mensagens.append({"role": "user", "content": texto})
+
+    try:
+        resp = await asyncio.to_thread(
+            lambda: grok.chat.completions.create(
+                model="grok-2-latest",
+                messages=mensagens,
+                temperature=1,
+                max_tokens=120
+            )
+        )
+
+        return resp.choices[0].message.content.strip()
+
+    except Exception as e:
+        print("[IA ERROR]", e)
+        return "..."
+
+# =========================================
+# MUSIC READY
+# =========================================
+
+@bot.command()
+async def play(ctx, *, search: str):
+
+    if not ctx.author.voice:
+        await ctx.send("entra na call")
+        return
+
+    channel = ctx.author.voice.channel
+    player = ctx.voice_client
+
+    if not player:
+        player = await channel.connect(cls=wavelink.Player)
+
+    try:
+        tracks = await wavelink.Playable.search(search)
+
+        if not tracks:
+            await ctx.send("n achei")
+            return
+
+        await player.play(tracks[0])
+        await ctx.send(f"tocando: {tracks[0].title}")
+
+    except Exception as e:
+        print("[PLAY ERROR]", e)
+        await ctx.send("erro música")
+
+@bot.command()
+async def stop(ctx):
+    if ctx.voice_client:
+        await ctx.voice_client.disconnect()
+
+@bot.command()
+async def skip(ctx):
+    if ctx.voice_client:
+        await ctx.voice_client.stop()
+
+# =========================================
+# ON READY SAFE
 # =========================================
 
 @bot.event
 async def on_ready():
-    global _eva_ready
 
-    if _eva_ready:
+    global _ready_once
+
+    if _ready_once:
         return
 
-    _eva_ready = True
+    _ready_once = True
 
-    print(f"[EVA] online como {bot.user}")
+    print(f"EVA ONLINE {bot.user}")
 
     try:
         node = wavelink.Node(
@@ -150,54 +273,54 @@ async def on_ready():
         )
 
         await wavelink.Pool.connect(nodes=[node], client=bot)
-        print("[LAVALINK] conectado")
+        print("Lavalink OK")
 
     except Exception as e:
-        print("[LAVALINK ERROR]", repr(e))
+        print("[LAVALINK ERROR]", e)
 
-    bot.loop.create_task(vida_da_eva())
-    bot.loop.create_task(pensamentos_aleatorios())
+    asyncio.create_task(loop_eva())
 
 # =========================================
-# ON MESSAGE FIX (CRÍTICO)
+# BACKGROUND LOOP
+# =========================================
+
+async def loop_eva():
+
+    await bot.wait_until_ready()
+
+    while not bot.is_closed():
+        await asyncio.sleep(random.randint(1800, 3600))
+        print("EVA LOOP OK")
+
+# =========================================
+# MESSAGE HANDLER (FIXED)
 # =========================================
 
 @bot.event
 async def on_message(message):
 
-    try:
-        if message.author.bot:
-            return
+    if message.author.bot:
+        return
 
-        print("[MSG]", message.content)
+    print("[MSG]", message.content)
 
-        texto = message.content.strip()
+    await bot.process_commands(message)
 
-        # comandos primeiro
-        await bot.process_commands(message)
+    texto = message.content.lower().strip()
 
-        if not texto:
-            return
+    if not (texto.startswith("eva/") or bot.user in message.mentions):
+        return
 
-        if texto.startswith("eva/"):
-            texto_limpo = texto.replace("eva/", "").strip()
-        elif bot.user in message.mentions:
-            texto_limpo = texto.replace(f"<@{bot.user.id}>", "").strip()
-        else:
-            return
+    clean = texto.replace("eva/", "").replace(f"<@{bot.user.id}>", "").strip()
 
-        if not texto_limpo:
-            texto_limpo = "oi"
+    if not clean:
+        clean = "oi"
 
-        async with message.channel.typing():
-            await asyncio.sleep(random.uniform(0.5, 1.5))
+    async with message.channel.typing():
+        await asyncio.sleep(1)
+        resp = await gerar_resposta(message.author.id, clean)
 
-            resposta = await gerar_texto(message.author.id, texto_limpo)
-
-        await message.reply(resposta)
-
-    except Exception as e:
-        print("[ON_MESSAGE ERROR]", repr(e))
+    await message.reply(resp)
 
 # =========================================
 # RUN
