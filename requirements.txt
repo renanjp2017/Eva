@@ -5,6 +5,4 @@ openai
 groq
 duckduckgo-search
 requests
-yt-dlp
-ffmpeg-python
-audioop-lts
+wavelink==3.4.1
