@@ -3,7 +3,7 @@
 # =========================================
 
 import discord
-import yt_dlp
+import wavelink
 import random
 import asyncio
 import os
@@ -30,6 +30,10 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 CANAL_PENSAMENTOS = int(
     os.getenv("CANAL_PENSAMENTOS", "0")
 )
+
+LAVALINK_HOST = os.getenv("LAVALINK_HOST", "lavalink.railway.internal")
+LAVALINK_PORT = int(os.getenv("LAVALINK_PORT", "2333"))
+LAVALINK_PASSWORD = os.getenv("LAVALINK_PASSWORD", "evabotsenha")
 
 # =========================================
 # IA
@@ -547,80 +551,11 @@ async def gerar_texto(user_id, texto):
     return resposta
 
 # =========================================
-# YOUTUBE + PIPED
-# =========================================
-
-YDL_OPTIONS = {
-    "format": "bestaudio/best",
-    "quiet": True,
-    "nocheckcertificate": True,
-    "ignoreerrors": True,
-    "no_warnings": True,
-    "default_search": "ytsearch",
-    "source_address": "0.0.0.0"
-}
-
-FFMPEG_OPTIONS = {
-    "before_options": (
-        "-reconnect 1 "
-        "-reconnect_streamed 1 "
-        "-reconnect_delay_max 5"
-    ),
-    "options": "-vn"
-}
-
-PIPED_INSTANCES = [
-    "https://piped.video",
-    "https://piped.adminforge.de",
-    "https://piped.projectsegfau.lt"
-]
-
-def buscar_piped(query):
-
-    for instancia in PIPED_INSTANCES:
-
-        try:
-
-            url = (
-                f"{instancia}/api/search?"
-                f"q={query}&filter=videos"
-            )
-
-            r = requests.get(
-                url,
-                timeout=10
-            ).json()
-
-            items = r.get("items", [])
-
-            if items:
-
-                video = items[0]
-
-                video_url = video.get(
-                    "url",
-                    ""
-                )
-
-                if "watch?v=" in video_url:
-
-                    return (
-                        "https://youtube.com"
-                        f"{video_url}"
-                    )
-
-        except Exception as e:
-
-            print(e)
-
-    return None
-
-# =========================================
-# MUSIC
+# MUSIC (WAVELINK + LAVALINK)
 # =========================================
 
 @bot.command(name="play")
-async def play(ctx, *, search):
+async def play(ctx, *, search: str):
 
     if not ctx.author.voice:
 
@@ -632,123 +567,103 @@ async def play(ctx, *, search):
 
     canal = ctx.author.voice.channel
 
-    if ctx.voice_client is None:
+    player: wavelink.Player = ctx.voice_client
 
-        vc = await canal.connect()
+    if player is None:
 
-    else:
+        try:
 
-        vc = ctx.voice_client
+            player = await canal.connect(
+                cls=wavelink.Player
+            )
 
-    await ctx.send(
-        "procurando música..."
-    )
+        except Exception as e:
+
+            print(e)
+
+            await ctx.send(
+                "n consegui entrar na call"
+            )
+
+            return
+
+    await ctx.send("procurando música...")
 
     try:
 
-        url = search
+        tracks = await wavelink.Playable.search(search)
 
-        if "http" not in search:
+        if not tracks:
 
-            piped_url = buscar_piped(
-                search
-            )
-
-            if piped_url:
-
-                url = piped_url
-
-        loop = asyncio.get_event_loop()
-
-        data = await loop.run_in_executor(
-            None,
-            lambda: yt_dlp.YoutubeDL(
-                YDL_OPTIONS
-            ).extract_info(
-                url,
-                download=False
-            )
-        )
-
-        if not data:
-
-            await ctx.send(
-                "youtube morreu dnv"
-            )
+            await ctx.send("n achei isso")
 
             return
 
-        if "entries" in data:
+        track = tracks[0]
 
-            data = data["entries"][0]
-
-        if not data:
-
-            await ctx.send(
-                "n achei isso"
-            )
-
-            return
-
-        audio_url = data.get("url")
-
-        titulo = data.get(
-            "title",
-            "música"
-        )
-
-        if not audio_url:
-
-            await ctx.send(
-                "falhou pegando áudio"
-            )
-
-            return
-
-        source = discord.FFmpegPCMAudio(
-            audio_url,
-            **FFMPEG_OPTIONS
-        )
-
-        if vc.is_playing():
-
-            vc.stop()
-
-        vc.play(source)
+        await player.play(track)
 
         await ctx.send(
-            f"tocando: {titulo}"
+            f"tocando: {track.title}"
         )
 
     except Exception as e:
 
         print(e)
 
-        await ctx.send(
-            "youtube surtou"
-        )
+        await ctx.send("lavalink surtou")
+
 
 @bot.command(name="stop")
 async def stop(ctx):
 
-    if ctx.voice_client:
+    player: wavelink.Player = ctx.voice_client
 
-        await ctx.voice_client.disconnect()
+    if player:
 
-        await ctx.send(
-            "silêncio finalmente"
-        )
+        await player.disconnect()
+
+        await ctx.send("silêncio finalmente")
+
 
 @bot.command(name="skip")
 async def skip(ctx):
 
-    if ctx.voice_client:
+    player: wavelink.Player = ctx.voice_client
 
-        ctx.voice_client.stop()
+    if player:
 
-        await ctx.send(
-            "pulada"
-        )
+        await player.stop()
+
+        await ctx.send("pulada")
+
+
+@bot.command(name="pause")
+async def pause(ctx):
+
+    player: wavelink.Player = ctx.voice_client
+
+    if player and player.playing:
+
+        await player.pause(not player.paused)
+
+        estado = "pausada" if player.paused else "voltou"
+
+        await ctx.send(estado)
+
+
+@bot.command(name="volume")
+async def volume(ctx, vol: int):
+
+    player: wavelink.Player = ctx.voice_client
+
+    if player:
+
+        vol = max(0, min(100, vol))
+
+        await player.set_volume(vol)
+
+        await ctx.send(f"volume: {vol}")
 
 # =========================================
 # READY
@@ -760,6 +675,18 @@ async def on_ready():
     print(
         f"Eva online como {bot.user}"
     )
+
+    node = wavelink.Node(
+        uri=f"http://{LAVALINK_HOST}:{LAVALINK_PORT}",
+        password=LAVALINK_PASSWORD
+    )
+
+    await wavelink.Pool.connect(
+        nodes=[node],
+        client=bot
+    )
+
+    print("Lavalink conectado")
 
     bot.loop.create_task(
         vida_da_eva()
