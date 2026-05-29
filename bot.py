@@ -1,8 +1,11 @@
 import discord
-import requests
 import io
+import re
 import random
 import asyncio
+import os
+import sqlite3
+import yt_dlp
 import google.generativeai as genai
 import os
 from openai import OpenAI
