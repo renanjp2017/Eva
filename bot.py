@@ -671,16 +671,13 @@ async def volume(ctx, vol: int):
 
 @bot.event
 async def on_ready():
+    print(f"Eva online como {bot.user}")
 
-    print(
-        f"Eva online como {bot.user}"
+    # Indentação corrigida aqui:
+    node = wavelink.Node(
+        uri=f"http://{LAVALINK_HOST}:{LAVALINK_PORT}",
+        password=LAVALINK_PASSWORD
     )
-
-    # No on_ready
-node = wavelink.Node(
-    uri=f"http://{LAVALINK_HOST}:{LAVALINK_PORT}",
-    password=LAVALINK_PASSWORD
-)
 
     await wavelink.Pool.connect(
         nodes=[node],
