@@ -1,13 +1,11 @@
-# =========================================
-# EVA DISCORD BOT v2 - ARCHITECTURE BUILD
-# =========================================
-
 import discord
 import wavelink
 import random
 import asyncio
 import os
 import sqlite3
+import json
+import traceback
 
 from openai import OpenAI
 from groq import Groq
@@ -49,6 +47,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
 intents.guilds = True
+intents.members = True
 
 bot = commands.Bot(command_prefix="eva/", intents=intents)
 
@@ -58,6 +57,7 @@ _ready = False
 # DATABASE
 # =========================================
 
+# check_same_thread=False to allow access from async threads
 conn = sqlite3.connect("eva.db", check_same_thread=False)
 cursor = conn.cursor()
 
@@ -110,7 +110,6 @@ REGRAS:
 - Respostas devem parecer mensagens humanas curtas de Discord.
 - Pode ser rude, seca ou indiferente.
 - Evite frases completas.
-
 """
 
 # =========================================
@@ -165,17 +164,26 @@ def update_state():
 # =========================================
 
 def save_memory(uid, role, text):
-    cursor.execute("INSERT INTO user_memory VALUES (?,?,?)",
-                   (str(uid), role, text))
-    conn.commit()
+    try:
+        cursor.execute("INSERT INTO user_memory VALUES (?,?,?)",
+                       (str(uid), role, text))
+        conn.commit()
+    except Exception as e:
+        print("[DB SAVE MEMORY ERROR]", e)
+        traceback.print_exc()
 
 def load_memory(uid):
-    cursor.execute("""
-    SELECT role, content FROM user_memory
-    WHERE user_id=?
-    ORDER BY ROWID DESC LIMIT 10
-    """, (str(uid),))
-    return list(reversed(cursor.fetchall()))
+    try:
+        cursor.execute("""
+        SELECT role, content FROM user_memory
+        WHERE user_id=?
+        ORDER BY ROWID DESC LIMIT 10
+        """, (str(uid),))
+        return list(reversed(cursor.fetchall()))
+    except Exception as e:
+        print("[DB LOAD MEMORY ERROR]", e)
+        traceback.print_exc()
+        return []
 
 # =========================================
 # DUCKDUCKGO TOOL
@@ -186,15 +194,16 @@ def ddg(query):
         with DDGS() as d:
             res = list(d.text(query, max_results=3))
         return "\n".join([f"{r['title']}: {r['body']}" for r in res])
-    except:
+    except Exception as e:
+        print("[DDG ERROR]", e)
+        traceback.print_exc()
         return ""
 
 # =========================================
-# INTENT (GROQ ROUTER)
+# INTENT (GROQ ROUTER) - robust parsing
 # =========================================
 
 async def get_intent(text):
-
     prompt = f"""
 Classifique:
 
@@ -206,7 +215,6 @@ JSON:
 "search": true/false
 }}
 """
-
     try:
         r = await asyncio.to_thread(
             lambda: groq.chat.completions.create(
@@ -215,18 +223,33 @@ JSON:
                 temperature=0
             )
         )
-
-        return r.choices[0].message.content
-
-    except:
-        return '{"intent":"chat","search":false}'
+        raw = r.choices[0].message.content
+        # tenta parsear JSON do retorno
+        try:
+            parsed = json.loads(raw)
+            return parsed
+        except:
+            # tenta extrair JSON dentro do texto
+            start = raw.find('{')
+            end = raw.rfind('}') + 1
+            if start != -1 and end != -1:
+                try:
+                    parsed = json.loads(raw[start:end])
+                    return parsed
+                except:
+                    pass
+        # fallback seguro
+        return {"intent":"chat","search":False}
+    except Exception as e:
+        print("[INTENT ERROR]", e)
+        traceback.print_exc()
+        return {"intent":"chat","search":False}
 
 # =========================================
-# GROK FINAL (PERSONALITY ENGINE)
+# GROK FINAL (PERSONALITY ENGINE) - robust
 # =========================================
 
 async def grok_answer(uid, text, context):
-
     state = get_state()
     memory = load_memory(uid)
 
@@ -257,9 +280,13 @@ CONTEXTO:
                 max_tokens=140
             )
         )
-        return r.choices[0].message.content.strip()
-
-    except:
+        ans = r.choices[0].message.content.strip()
+        if not ans:
+            return None
+        return ans
+    except Exception as e:
+        print("[GROK ERROR]", e)
+        traceback.print_exc()
         return None
 
 # =========================================
@@ -275,8 +302,11 @@ async def fallback(text):
                 temperature=1
             )
         )
-        return r.choices[0].message.content.strip()
-    except:
+        ans = r.choices[0].message.content.strip()
+        return ans if ans else "..."
+    except Exception as e:
+        print("[FALLBACK ERROR]", e)
+        traceback.print_exc()
         return "..."
 
 # =========================================
@@ -284,12 +314,14 @@ async def fallback(text):
 # =========================================
 
 async def generate(uid, text):
-
-    intent = await get_intent(text)
-    needs_search = "true" in intent.lower()
+    intent_obj = await get_intent(text)
+    needs_search = False
+    try:
+        needs_search = bool(intent_obj.get("search", False))
+    except:
+        needs_search = False
 
     context = ""
-
     if needs_search:
         context = ddg(text)
 
@@ -300,10 +332,13 @@ async def generate(uid, text):
     if not response:
         response = await fallback(text)
 
-    save_memory(uid, "user", text)
-    save_memory(uid, "assistant", response)
+    # só salva se houver texto/resposta válidos
+    if text:
+        save_memory(uid, "user", text)
+    if response:
+        save_memory(uid, "assistant", response)
 
-    return response
+    return response or "..."
 
 # =========================================
 # MUSIC
@@ -311,7 +346,6 @@ async def generate(uid, text):
 
 @bot.command()
 async def play(ctx, *, search: str):
-
     if not ctx.author.voice:
         return await ctx.send("entra na call")
 
@@ -319,11 +353,29 @@ async def play(ctx, *, search: str):
     player = ctx.voice_client
 
     try:
-        if not player:
+        # se Pool não tem nodes conectados, tenta reconectar
+        if not getattr(wavelink.Pool, "nodes", None) or len(wavelink.Pool.nodes) == 0:
+            print("[MUSIC] Pool sem nodes, tentando reconectar...")
+            try:
+                node = wavelink.Node(
+                    host=LAVALINK_HOST,
+                    port=LAVALINK_PORT,
+                    password=LAVALINK_PASSWORD,
+                    rest_uri=f"http://{LAVALINK_HOST}:{LAVALINK_PORT}"
+                )
+                await wavelink.Pool.connect(nodes=[node], client=bot)
+                print("[MUSIC] Pool reconectado")
+            except Exception as e:
+                print("[MUSIC] falha ao reconectar Pool:", e)
+                traceback.print_exc()
+
+        # conecta se não houver player ou não estiver conectado
+        if not player or not getattr(player, "is_connected", lambda: False)():
             player = await channel.connect(cls=wavelink.Player)
 
-        tracks = await wavelink.Playable.search(search)
+        await ctx.send("procurando música...")
 
+        tracks = await wavelink.Playable.search(search)
         if not tracks:
             return await ctx.send("n achei")
 
@@ -331,8 +383,45 @@ async def play(ctx, *, search: str):
         await ctx.send(f"tocando: {tracks[0].title}")
 
     except Exception as e:
-        print("[MUSIC]", e)
+        print("[MUSIC ERROR]", e)
+        traceback.print_exc()
+        # tenta desconectar com segurança se estiver conectado
+        try:
+            if ctx.voice_client and ctx.voice_client.is_connected():
+                await ctx.voice_client.disconnect()
+        except:
+            pass
         await ctx.send("erro música")
+
+@bot.command()
+async def stop(ctx):
+    player = ctx.voice_client
+    if player and player.is_connected():
+        await player.disconnect()
+        await ctx.send("silêncio finalmente")
+
+@bot.command()
+async def skip(ctx):
+    player = ctx.voice_client
+    if player and player.is_connected():
+        await player.stop()
+        await ctx.send("pulada")
+
+@bot.command()
+async def pause(ctx):
+    player = ctx.voice_client
+    if player and player.is_connected() and player.playing:
+        await player.pause(not player.paused)
+        estado = "pausada" if player.paused else "voltou"
+        await ctx.send(estado)
+
+@bot.command()
+async def volume(ctx, vol: int):
+    player = ctx.voice_client
+    if player and player.is_connected():
+        vol = max(0, min(100, vol))
+        await player.set_volume(vol)
+        await ctx.send(f"volume: {vol}")
 
 # =========================================
 # READY
@@ -340,25 +429,28 @@ async def play(ctx, *, search: str):
 
 @bot.event
 async def on_ready():
-
     global _ready
     if _ready:
         return
     _ready = True
 
-    print("EVA ONLINE")
+    print("EVA ONLINE - on_ready")
 
     try:
         node = wavelink.Node(
-            uri=f"http://{LAVALINK_HOST}:{LAVALINK_PORT}",
-            password=LAVALINK_PASSWORD
+            host=LAVALINK_HOST,
+            port=LAVALINK_PORT,
+            password=LAVALINK_PASSWORD,
+            rest_uri=f"http://{LAVALINK_HOST}:{LAVALINK_PORT}"
         )
 
         await wavelink.Pool.connect(nodes=[node], client=bot)
-
+        print("[LAVALINK] Pool conectado")
     except Exception as e:
-        print("[LAVALINK]", e)
+        print("[LAVALINK CONNECT ERROR]", e)
+        traceback.print_exc()
 
+    # start life loop
     asyncio.create_task(loop())
 
 # =========================================
@@ -367,10 +459,13 @@ async def on_ready():
 
 async def loop():
     await bot.wait_until_ready()
-
     while not bot.is_closed():
         await asyncio.sleep(random.randint(1800, 3600))
-        update_state()
+        try:
+            update_state()
+        except Exception as e:
+            print("[LOOP ERROR]", e)
+            traceback.print_exc()
 
 # =========================================
 # MESSAGE HANDLER
@@ -378,7 +473,6 @@ async def loop():
 
 @bot.event
 async def on_message(message):
-
     if message.author.bot:
         return
 
@@ -396,12 +490,28 @@ async def on_message(message):
 
     async with message.channel.typing():
         await asyncio.sleep(1)
-        resp = await generate(message.author.id, clean)
+        try:
+            resp = await generate(message.author.id, clean)
+        except Exception as e:
+            print("[GENERATE ERROR]", e)
+            traceback.print_exc()
+            resp = "..."
 
-    await message.reply(resp)
+    # garante que sempre haja uma string
+    if not resp:
+        resp = "..."
+
+    try:
+        await message.reply(resp)
+    except Exception as e:
+        print("[REPLY ERROR]", e)
+        traceback.print_exc()
 
 # =========================================
 # RUN
 # =========================================
 
-bot.run(DISCORD_TOKEN)
+if not DISCORD_TOKEN:
+    print("ERROR: DISCORD_TOKEN not set in environment")
+else:
+    bot.run(DISCORD_TOKEN)
