@@ -160,6 +160,16 @@ async def grok_answer(uid, text, ctx):
     return "..."
 
 # =========================
+# IGNORAR ERROS FALSOS NO CONSOLE
+# =========================
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CommandNotFound):
+        pass # Ignora silenciosamente comandos inválidos
+    else:
+        print(f"Erro no comando: {error}")
+
+# =========================
 # WAVELINK & MÚSICA (COM FILA)
 # =========================
 @bot.listen('on_ready')
@@ -196,7 +206,9 @@ async def play(ctx, *, search: str):
             return await ctx.send(f"deu erro pra entrar: {e}")
 
     await ctx.typing()
-    tracks: wavelink.Search = await wavelink.Playable.search(search)
+    
+    # FORÇANDO O SOUNDCLOUD PRA FUGIR DO ERRO BASE.JS DO YOUTUBE
+    tracks: wavelink.Search = await wavelink.Playable.search(search, source=wavelink.TrackSource.SoundCloud)
     
     if not tracks:
         return await ctx.send("não achei essa merda de música.")
@@ -233,48 +245,46 @@ async def on_message(message):
     if message.author.bot:
         return
 
-    # Executa os comandos normais de música primeiro (.play, .skip, .stop)
-    await bot.process_commands(message)
-
     text = message.content.strip()
 
-    # O chat natural só responde se começar com .eva
-    if not text.startswith(".eva"):
-        return
+    # Se for mensagem direta para a Eva (.eva), processamos o chat
+    if text.startswith(".eva"):
+        clean = text.replace(".eva", "", 1).strip()
+        if not clean:
+            clean = "q foi?"
 
-    clean = text.replace(".eva", "", 1).strip()
-    if not clean:
-        clean = "q foi?"
+        async with message.channel.typing():
+            # 1. ROTEAMENTO DE INTENÇÃO (GROQ)
+            intent_data = await analyze_intent(clean)
+            intent = intent_data.get("intent", "CHAT")
+            query = intent_data.get("query", clean)
 
-    async with message.channel.typing():
-        # 1. ROTEAMENTO DE INTENÇÃO (GROQ)
-        intent_data = await analyze_intent(clean)
-        intent = intent_data.get("intent", "CHAT")
-        query = intent_data.get("query", clean)
-
-        ctx_str = ""
-        
-        # 2. AÇÕES BASEADAS NA INTENÇÃO
-        if intent == "PLAY":
-            # Repassa pro comando de tocar música
-            ctx = await bot.get_context(message)
-            await ctx.invoke(bot.get_command('play'), search=query)
-            # Eva responde no chat sobre estar tocando a música
-            resp = await grok_answer(message.author.id, f"Responda ao usuário que você está botando a música '{query}' para tocar", "")
-        
-        elif intent == "SEARCH":
-            # Pesquisa no DuckDuckGo
-            ctx_str = ddg(query)
-            resp = await grok_answer(message.author.id, clean, ctx_str)
+            ctx_str = ""
             
-        else: # CHAT
-            resp = await grok_answer(message.author.id, clean, "")
+            # 2. AÇÕES BASEADAS NA INTENÇÃO
+            if intent == "PLAY":
+                ctx = await bot.get_context(message)
+                await ctx.invoke(bot.get_command('play'), search=query)
+                resp = await grok_answer(message.author.id, f"Responda ao usuário que você está botando a música '{query}' para tocar", "")
+            
+            elif intent == "SEARCH":
+                ctx_str = ddg(query)
+                resp = await grok_answer(message.author.id, clean, ctx_str)
+                
+            else: # CHAT
+                resp = await grok_answer(message.author.id, clean, "")
 
-        # 3. SALVA NA MEMÓRIA E ENVIA
-        if intent != "PLAY": # O Play já enviou mensagem no comando
-            save(message.author.id, "user", clean)
-            save(message.author.id, "assistant", resp)
-            await message.reply(resp)
+            # 3. SALVA NA MEMÓRIA E ENVIA
+            if intent != "PLAY": # O Play já enviou mensagem no comando
+                save(message.author.id, "user", clean)
+                save(message.author.id, "assistant", resp)
+                await message.reply(resp)
+                
+        # Interrompe a execução aqui para não dar o erro CommandNotFound no console
+        return 
+
+    # Se não for .eva (ex: .play, .skip, .stop), processa os comandos normais
+    await bot.process_commands(message)
 
 # =========================
 # RUN
