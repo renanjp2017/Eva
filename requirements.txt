@@ -1,6 +1,9 @@
 discord.py[voice]
+openai
+groq
+python-dotenv
+requests
+duckduckgo-search
 yt-dlp
 PyNaCl
-python-dotenv
-openai
-aiohttp
+ffmpeg-python
