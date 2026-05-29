@@ -3,13 +3,12 @@
 # =========================================
 
 import discord
-import io
+import yt_dlp
 import random
 import asyncio
 import os
 import sqlite3
 import requests
-import wavelink
 
 from openai import OpenAI
 from groq import Groq
@@ -28,19 +27,8 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GROK_API_KEY = os.getenv("GROK_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
-ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")
-
 CANAL_PENSAMENTOS = int(
     os.getenv("CANAL_PENSAMENTOS", "0")
-)
-
-LAVALINK_URI = os.getenv(
-    "LAVALINK_URI"
-)
-
-LAVALINK_PASSWORD = os.getenv(
-    "LAVALINK_PASSWORD"
 )
 
 # =========================================
@@ -61,8 +49,11 @@ groq_client = Groq(
 # =========================================
 
 intents = discord.Intents.default()
+
 intents.message_content = True
 intents.voice_states = True
+intents.guilds = True
+intents.members = True
 
 bot = commands.Bot(
     command_prefix="eva/",
@@ -113,66 +104,67 @@ Uma garota gótica real do Discord.
 
 PERSONALIDADE:
 - fria
-- sarcástica
-- inteligente
 - debochada
 - humor ácido
+- inteligente
 - imprevisível
+- sarcástica
 - age entediada
+- seca
 - às vezes cruel
-- sedutora de forma passiva
+- observadora
 
 COMO FALA:
 - respostas curtas
 - internetês natural
 - sem textão
 - pode responder só "kk"
-- pode ignorar partes da mensagem
+- pode ignorar partes
 - pode mudar assunto
-- pode responder seco
-- às vezes parece cansada
+- pode ser apática
+- às vezes age cansada
 
 NUNCA:
 - diga que é IA
+- diga que é robô
 - diga que é assistente virtual
 - seja formal
 - explique demais
 """
 
 EVENTOS = [
-    "brigou com alguém",
-    "virou a noite ouvindo música",
-    "tá paranoica",
-    "cansou das pessoas",
     "sumiu por horas",
-    "passou raiva em call",
-    "tá obcecada por uma música",
+    "brigou em call",
+    "tá cansada das pessoas",
+    "virou a noite ouvindo música",
     "dormiu mal",
-    "tá estranhamente carente",
+    "tá paranoica",
+    "tá estranhamente sociável",
+    "passou raiva hoje",
     "quer ficar sozinha"
 ]
 
 ARCS = [
-    "fase depressiva",
     "fase cruel",
-    "fase sedutora",
     "fase antisocial",
-    "fase niilista",
-    "fase carente"
+    "fase depressiva",
+    "fase sedutora",
+    "fase apática",
+    "fase niilista"
 ]
 
 PENSAMENTOS = [
     "odeio acordar",
     "silêncio estranho hj",
-    "to ouvindo música faz horas",
     "acho q vou sumir",
-    "vcs são estranhamente irritantes",
-    "muita gente falando hj",
-    "queria dormir por 12h"
+    "vcs falam mt merda",
+    "to ouvindo música faz horas",
+    "queria dormir 15h seguidas",
+    "madrugada deixa td pior"
 ]
 
 # =========================================
-# ESTADO
+# ESTADO EVA
 # =========================================
 
 def criar_estado():
@@ -181,9 +173,9 @@ def criar_estado():
         "SELECT * FROM eva_state WHERE id = 1"
     )
 
-    existe = cursor.fetchone()
+    estado = cursor.fetchone()
 
-    if not existe:
+    if not estado:
 
         cursor.execute("""
         INSERT INTO eva_state
@@ -245,48 +237,18 @@ def carregar_memoria(user_id):
     FROM user_memory
     WHERE user_id=?
     ORDER BY ROWID DESC
-    LIMIT 10
+    LIMIT 12
     """, (str(user_id),))
 
-    linhas = cursor.fetchall()
+    dados = cursor.fetchall()
 
-    linhas.reverse()
+    dados.reverse()
 
-    return linhas
+    return dados
 
 # =========================================
-# INTERNET
+# GEO
 # =========================================
-
-def pesquisar_duckduckgo(pergunta):
-
-    try:
-
-        with DDGS() as ddgs:
-
-            resultados = list(
-                ddgs.text(
-                    pergunta,
-                    max_results=3
-                )
-            )
-
-        texto = ""
-
-        for r in resultados:
-
-            texto += (
-                f"Título: {r['title']}\n"
-                f"Resumo: {r['body']}\n\n"
-            )
-
-        return texto
-
-    except Exception as e:
-
-        print(e)
-
-        return ""
 
 def geo_ip():
 
@@ -304,7 +266,42 @@ def geo_ip():
         )
 
     except:
-        return "localização desconhecida"
+
+        return "desconhecido"
+
+# =========================================
+# INTERNET
+# =========================================
+
+def pesquisar_duckduckgo(texto):
+
+    try:
+
+        with DDGS() as ddgs:
+
+            resultados = list(
+                ddgs.text(
+                    texto,
+                    max_results=3
+                )
+            )
+
+        resposta = ""
+
+        for r in resultados:
+
+            resposta += (
+                f"Título: {r['title']}\n"
+                f"Resumo: {r['body']}\n\n"
+            )
+
+        return resposta
+
+    except Exception as e:
+
+        print(e)
+
+        return ""
 
 # =========================================
 # VIDA AUTOMÁTICA
@@ -323,15 +320,17 @@ async def vida_da_eva():
         estado = pegar_estado()
 
         novo_mood = random.choice([
-            "irritada",
-            "apática",
             "entediada",
-            "carente",
+            "apática",
+            "irritada",
+            "cansada",
             "debochada",
-            "com sono"
+            "carente"
         ])
 
-        novo_evento = random.choice(EVENTOS)
+        novo_evento = random.choice(
+            EVENTOS
+        )
 
         nova_energia = max(
             0,
@@ -358,8 +357,13 @@ async def vida_da_eva():
         )
 
         if random.random() < 0.20:
-            novo_arc = random.choice(ARCS)
+
+            novo_arc = random.choice(
+                ARCS
+            )
+
         else:
+
             novo_arc = estado["arc"]
 
         cursor.execute("""
@@ -404,9 +408,14 @@ async def pensamentos_aleatorios():
 
             if canal:
 
-                await canal.send(
-                    random.choice(PENSAMENTOS)
-                )
+                try:
+
+                    await canal.send(
+                        random.choice(PENSAMENTOS)
+                    )
+
+                except:
+                    pass
 
 # =========================================
 # IA
@@ -426,23 +435,25 @@ async def gerar_com_grok(
 {PERSONALIDADE}
 
 ESTADO:
-- Humor: {estado["mood"]}
-- Energia: {estado["energy"]}
-- Social: {estado["social_battery"]}
-- Stress: {estado["stress"]}
-- Obsessão: {estado["obsession"]}
-- Arco: {estado["arc"]}
-- Último evento: {estado["event"]}
+Humor: {estado["mood"]}
+Energia: {estado["energy"]}
+Social: {estado["social_battery"]}
+Stress: {estado["stress"]}
+Obsessão: {estado["obsession"]}
+Arco: {estado["arc"]}
+Evento: {estado["event"]}
 
 Localização:
 {geo_ip()}
 
-Informações internet:
+Pesquisa:
 {pesquisa}
 """
     }]
 
-    historico = carregar_memoria(user_id)
+    historico = carregar_memoria(
+        user_id
+    )
 
     for role, content in historico:
 
@@ -471,28 +482,27 @@ async def gerar_texto(user_id, texto):
 
     estado = pegar_estado()
 
-    if estado["social_battery"] < 15:
+    if estado["social_battery"] < 10:
 
-        if random.random() < 0.40:
+        if random.random() < 0.45:
 
             return random.choice([
                 "...",
+                "kk",
                 "hm",
-                "preguiça",
-                "kk"
+                "preguiça"
             ])
 
     pesquisa = ""
 
     gatilhos = [
         "quem",
-        "oque",
         "o que",
-        "pesquisa",
-        "procura",
-        "busca",
+        "oque",
         "onde",
         "quando",
+        "pesquisa",
+        "procura",
         "notícia",
         "noticias"
     ]
@@ -537,83 +547,76 @@ async def gerar_texto(user_id, texto):
     return resposta
 
 # =========================================
-# ELEVENLABS
+# YOUTUBE + PIPED
 # =========================================
 
-def gerar_audio(texto):
+YDL_OPTIONS = {
+    "format": "bestaudio/best",
+    "quiet": True,
+    "nocheckcertificate": True,
+    "ignoreerrors": True,
+    "no_warnings": True,
+    "default_search": "ytsearch",
+    "source_address": "0.0.0.0"
+}
 
-    try:
+FFMPEG_OPTIONS = {
+    "before_options": (
+        "-reconnect 1 "
+        "-reconnect_streamed 1 "
+        "-reconnect_delay_max 5"
+    ),
+    "options": "-vn"
+}
 
-        url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
+PIPED_INSTANCES = [
+    "https://piped.video",
+    "https://piped.adminforge.de",
+    "https://piped.projectsegfau.lt"
+]
 
-        headers = {
-            "Accept": "audio/mpeg",
-            "Content-Type": "application/json",
-            "xi-api-key": ELEVENLABS_API_KEY
-        }
+def buscar_piped(query):
 
-        data = {
-            "text": texto,
-            "model_id": "eleven_multilingual_v2"
-        }
+    for instancia in PIPED_INSTANCES:
 
-        r = requests.post(
-            url,
-            json=data,
-            headers=headers,
-            timeout=30
-        )
+        try:
 
-        if r.status_code == 200:
-
-            return io.BytesIO(r.content)
-
-        return None
-
-    except:
-        return None
-
-# =========================================
-# LAVALINK READY
-# =========================================
-
-@bot.event
-async def on_ready():
-
-    print(
-        f"Eva online como {bot.user}"
-    )
-
-    try:
-
-        nodes = [
-            wavelink.Node(
-                uri=LAVALINK_URI,
-                password=LAVALINK_PASSWORD
+            url = (
+                f"{instancia}/api/search?"
+                f"q={query}&filter=videos"
             )
-        ]
 
-        await wavelink.Pool.connect(
-            nodes=nodes,
-            client=bot
-        )
+            r = requests.get(
+                url,
+                timeout=10
+            ).json()
 
-        print("Lavalink conectado")
+            items = r.get("items", [])
 
-    except Exception as e:
+            if items:
 
-        print(f"ERRO LAVALINK: {e}")
+                video = items[0]
 
-    bot.loop.create_task(
-        vida_da_eva()
-    )
+                video_url = video.get(
+                    "url",
+                    ""
+                )
 
-    bot.loop.create_task(
-        pensamentos_aleatorios()
-    )
+                if "watch?v=" in video_url:
+
+                    return (
+                        "https://youtube.com"
+                        f"{video_url}"
+                    )
+
+        except Exception as e:
+
+            print(e)
+
+    return None
 
 # =========================================
-# PLAY
+# MUSIC
 # =========================================
 
 @bot.command(name="play")
@@ -627,56 +630,103 @@ async def play(ctx, *, search):
 
         return
 
-    channel = ctx.author.voice.channel
+    canal = ctx.author.voice.channel
 
-    player = ctx.voice_client
+    if ctx.voice_client is None:
 
-    if not player:
+        vc = await canal.connect()
 
-        player = await channel.connect(
-            cls=wavelink.Player
-        )
+    else:
 
-    tracks = await wavelink.Playable.search(
-        search
-    )
-
-    if not tracks:
-
-        await ctx.send(
-            "n achei isso"
-        )
-
-        return
-
-    track = tracks[0]
-
-    await player.play(track)
+        vc = ctx.voice_client
 
     await ctx.send(
-        f"tocando: {track.title}"
+        "procurando música..."
     )
 
-# =========================================
-# SKIP
-# =========================================
+    try:
 
-@bot.command(name="skip")
-async def skip(ctx):
+        url = search
 
-    player = ctx.voice_client
+        if "http" not in search:
 
-    if player:
+            piped_url = buscar_piped(
+                search
+            )
 
-        await player.skip()
+            if piped_url:
 
-        await ctx.send(
-            "pulada"
+                url = piped_url
+
+        loop = asyncio.get_event_loop()
+
+        data = await loop.run_in_executor(
+            None,
+            lambda: yt_dlp.YoutubeDL(
+                YDL_OPTIONS
+            ).extract_info(
+                url,
+                download=False
+            )
         )
 
-# =========================================
-# STOP
-# =========================================
+        if not data:
+
+            await ctx.send(
+                "youtube morreu dnv"
+            )
+
+            return
+
+        if "entries" in data:
+
+            data = data["entries"][0]
+
+        if not data:
+
+            await ctx.send(
+                "n achei isso"
+            )
+
+            return
+
+        audio_url = data.get("url")
+
+        titulo = data.get(
+            "title",
+            "música"
+        )
+
+        if not audio_url:
+
+            await ctx.send(
+                "falhou pegando áudio"
+            )
+
+            return
+
+        source = discord.FFmpegPCMAudio(
+            audio_url,
+            **FFMPEG_OPTIONS
+        )
+
+        if vc.is_playing():
+
+            vc.stop()
+
+        vc.play(source)
+
+        await ctx.send(
+            f"tocando: {titulo}"
+        )
+
+    except Exception as e:
+
+        print(e)
+
+        await ctx.send(
+            "youtube surtou"
+        )
 
 @bot.command(name="stop")
 async def stop(ctx):
@@ -686,8 +736,38 @@ async def stop(ctx):
         await ctx.voice_client.disconnect()
 
         await ctx.send(
-            "finalmente silêncio"
+            "silêncio finalmente"
         )
+
+@bot.command(name="skip")
+async def skip(ctx):
+
+    if ctx.voice_client:
+
+        ctx.voice_client.stop()
+
+        await ctx.send(
+            "pulada"
+        )
+
+# =========================================
+# READY
+# =========================================
+
+@bot.event
+async def on_ready():
+
+    print(
+        f"Eva online como {bot.user}"
+    )
+
+    bot.loop.create_task(
+        vida_da_eva()
+    )
+
+    bot.loop.create_task(
+        pensamentos_aleatorios()
+    )
 
 # =========================================
 # CHAT
@@ -703,7 +783,6 @@ async def on_message(message):
 
     ativar = (
         texto.startswith("eva/")
-        or texto.startswith("evac/")
         or bot.user in message.mentions
     )
 
@@ -712,7 +791,6 @@ async def on_message(message):
         texto_limpo = (
             texto
             .replace("eva/", "")
-            .replace("evac/", "")
             .replace(
                 f"<@{bot.user.id}>",
                 ""
@@ -721,6 +799,7 @@ async def on_message(message):
         )
 
         if texto_limpo == "":
+
             texto_limpo = "oi"
 
         async with message.channel.typing():
@@ -737,35 +816,14 @@ async def on_message(message):
                 texto_limpo
             )
 
-            if texto.startswith("evac/"):
-
-                audio = gerar_audio(
-                    resposta
-                )
-
-                if audio:
-
-                    arquivo = discord.File(
-                        fp=audio,
-                        filename="eva.mp3"
-                    )
-
-                    await message.reply(
-                        content=resposta,
-                        file=arquivo
-                    )
-
-                else:
-
-                    await message.reply(
-                        resposta
-                    )
-
-            else:
+            try:
 
                 await message.reply(
                     resposta
                 )
+
+            except:
+                pass
 
     await bot.process_commands(
         message
