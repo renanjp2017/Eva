@@ -3,3 +3,4 @@ python-dotenv
 openai
 groq
 duckduckgo-search
+requests
