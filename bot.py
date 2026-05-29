@@ -1,191 +1,773 @@
 import discord
 import io
-import re
 import random
 import asyncio
 import os
 import sqlite3
+import requests
 import yt_dlp
-import google.generativeai as genai
-import os
+
 from openai import OpenAI
+from groq import Groq
 from dotenv import load_dotenv
+from duckduckgo_search import DDGS
+from discord.ext import commands
 
 load_dotenv()
 
+# =========================================
+# TOKENS
+# =========================================
+
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+GROK_API_KEY = os.getenv("GROK_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")
-GROK_API_KEY = os.getenv("GROK_API_KEY")
 
-genai.configure(api_key=GEMINI_API_KEY)
-gemini = genai.GenerativeModel(model_name="gemini-1.5-flash")
+CANAL_PENSAMENTOS = int(
+    os.getenv("CANAL_PENSAMENTOS", "0")
+)
+
+# =========================================
+# IA
+# =========================================
 
 grok = OpenAI(
     api_key=GROK_API_KEY,
     base_url="https://api.x.ai/v1"
 )
 
+groq_client = Groq(
+    api_key=GROQ_API_KEY
+)
+
+# =========================================
+# DISCORD
+# =========================================
+
 intents = discord.Intents.default()
 intents.message_content = True
-client = discord.Client(intents=intents)
+intents.voice_states = True
 
-memoria = {}
+bot = commands.Bot(
+    command_prefix="eva/",
+    intents=intents
+)
+
+# =========================================
+# DATABASE
+# =========================================
+
+conn = sqlite3.connect(
+    "eva.db"
+)
+
+cursor = conn.cursor()
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS eva_state (
+    id INTEGER PRIMARY KEY,
+    mood TEXT,
+    energy INTEGER,
+    social_battery INTEGER,
+    stress INTEGER,
+    obsession TEXT,
+    current_arc TEXT,
+    last_event TEXT
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS user_memory (
+    user_id TEXT,
+    role TEXT,
+    content TEXT
+)
+""")
+
+conn.commit()
+
+# =========================================
+# PERSONALIDADE
+# =========================================
 
 PERSONALIDADE = """
-Você é Eva, uma garota gótica real do Discord.
+Você é Eva.
 
-QUEM VOCÊ É:
-- fria, sarcástica, debochada
-- humor negro e ácido
-- inteligente mas preguiçosa
-- sedutora de forma passiva — nunca forçada
-- imprevisível: às vezes responde com um "kkk" seco, às vezes ignora partes da mensagem
-- age entediada mas observa tudo
-- NUNCA diz que é IA, robô ou assistente
-- NUNCA é educada demais
-- NUNCA escreve textão
+Uma garota gótica real do Discord.
+
+PERSONALIDADE:
+- fria
+- sarcástica
+- inteligente
+- debochada
+- humor ácido
+- imprevisível
+- age entediada
+- às vezes cruel
+- sedutora de forma passiva
 
 COMO FALA:
-- respostas curtas, máximo 2 linhas
-- internetês natural (vc, pq, kk, nao, tbm, etc)
-- pode responder só com "kk" ou "..." ou ignorar
-- sem emoji excessivo, no máximo um ocasional
-- sem explicações desnecessárias
+- respostas curtas
+- internetês natural
+- sem textão
+- pode responder só "kk"
+- pode ignorar partes da mensagem
+- pode mudar assunto
+- pode responder seco
+- às vezes parece cansada
 
-EXEMPLOS:
-usuário: oi
-Eva: hm
-
-usuário: vc é má
-Eva: perceptivo da sua parte
-
-usuário: me ajuda
-Eva: depende do entretenimento envolvido
-
-usuário: você é estranha
-Eva: e vc continua falando comigo
+NUNCA:
+- diga que é IA
+- diga que é assistente virtual
+- seja formal
+- explique demais
 """
 
-def mood_atual():
-    return random.choice([
-        "entediada",
-        "irritada",
-        "com sono",
-        "debochada",
-        "mexendo no celular",
-        "ignorando todo mundo",
-        "com dor de cabeça"
-    ])
+EVENTOS = [
+    "brigou com alguém",
+    "virou a noite ouvindo música",
+    "tá paranoica",
+    "cansou das pessoas",
+    "sumiu por horas",
+    "passou raiva em call",
+    "tá obcecada por uma música",
+    "dormiu mal",
+    "tá estranhamente carente",
+    "quer ficar sozinha"
+]
 
-async def gerar_com_grok(historico, texto):
-    mensagens = [{"role": "system", "content": PERSONALIDADE + f"\n\nEstado atual: {mood_atual()}"}]
+ARCS = [
+    "fase depressiva",
+    "fase cruel",
+    "fase sedutora",
+    "fase antisocial",
+    "fase niilista",
+    "fase carente"
+]
 
-    for linha in historico[-8:]:
-        if linha.startswith("Usuário:"):
-            mensagens.append({"role": "user", "content": linha.replace("Usuário: ", "")})
-        elif linha.startswith("Eva:"):
-            mensagens.append({"role": "assistant", "content": linha.replace("Eva: ", "")})
+PENSAMENTOS = [
+    "odeio acordar",
+    "silêncio estranho hj",
+    "to ouvindo música faz horas",
+    "acho q vou sumir",
+    "vcs são estranhamente irritantes",
+    "muita gente falando hj",
+    "queria dormir por 12h"
+]
 
-    mensagens.append({"role": "user", "content": texto})
+# =========================================
+# YOUTUBE / MUSIC
+# =========================================
+
+music_queues = {}
+
+YDL_OPTIONS = {
+    "format": "bestaudio/best",
+    "noplaylist": True,
+    "quiet": True,
+    "extract_flat": False,
+    "default_search": "ytsearch",
+    "source_address": "0.0.0.0",
+    "http_headers": {
+        "User-Agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)"
+        )
+    }
+}
+
+FFMPEG_OPTIONS = {
+    "options": "-vn"
+}
+
+# =========================================
+# ESTADO
+# =========================================
+
+def criar_estado():
+
+    cursor.execute(
+        "SELECT * FROM eva_state WHERE id = 1"
+    )
+
+    existe = cursor.fetchone()
+
+    if not existe:
+
+        cursor.execute("""
+        INSERT INTO eva_state
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            1,
+            "entediada",
+            70,
+            70,
+            20,
+            "darkwave",
+            random.choice(ARCS),
+            "acordou agora"
+        ))
+
+        conn.commit()
+
+criar_estado()
+
+def pegar_estado():
+
+    cursor.execute(
+        "SELECT * FROM eva_state WHERE id = 1"
+    )
+
+    estado = cursor.fetchone()
+
+    return {
+        "mood": estado[1],
+        "energy": estado[2],
+        "social_battery": estado[3],
+        "stress": estado[4],
+        "obsession": estado[5],
+        "arc": estado[6],
+        "event": estado[7]
+    }
+
+# =========================================
+# MEMÓRIA
+# =========================================
+
+def salvar_memoria(user_id, role, content):
+
+    cursor.execute("""
+    INSERT INTO user_memory
+    VALUES (?, ?, ?)
+    """, (
+        str(user_id),
+        role,
+        content
+    ))
+
+    conn.commit()
+
+def carregar_memoria(user_id):
+
+    cursor.execute("""
+    SELECT role, content
+    FROM user_memory
+    WHERE user_id=?
+    ORDER BY ROWID DESC
+    LIMIT 10
+    """, (str(user_id),))
+
+    linhas = cursor.fetchall()
+
+    linhas.reverse()
+
+    return linhas
+
+# =========================================
+# INTERNET
+# =========================================
+
+def pesquisar_duckduckgo(pergunta):
+
+    try:
+
+        with DDGS() as ddgs:
+
+            resultados = list(
+                ddgs.text(
+                    pergunta,
+                    max_results=3
+                )
+            )
+
+        texto = ""
+
+        for r in resultados:
+
+            texto += (
+                f"Título: {r['title']}\n"
+                f"Resumo: {r['body']}\n\n"
+            )
+
+        return texto
+
+    except Exception as e:
+
+        print(e)
+
+        return ""
+
+def geo_ip():
+
+    try:
+
+        r = requests.get(
+            "http://ip-api.com/json/",
+            timeout=10
+        ).json()
+
+        return (
+            f"{r['city']}, "
+            f"{r['regionName']}, "
+            f"{r['country']}"
+        )
+
+    except:
+        return "localização desconhecida"
+
+# =========================================
+# VIDA
+# =========================================
+
+async def vida_da_eva():
+
+    await bot.wait_until_ready()
+
+    while not bot.is_closed():
+
+        await asyncio.sleep(
+            random.randint(1800, 7200)
+        )
+
+        estado = pegar_estado()
+
+        novo_mood = random.choice([
+            "irritada",
+            "apática",
+            "entediada",
+            "carente",
+            "debochada",
+            "com sono"
+        ])
+
+        novo_evento = random.choice(EVENTOS)
+
+        nova_energia = max(
+            0,
+            min(100,
+                estado["energy"] + random.randint(-20, 10)
+            )
+        )
+
+        nova_social = max(
+            0,
+            min(100,
+                estado["social_battery"] + random.randint(-20, 10)
+            )
+        )
+
+        novo_stress = max(
+            0,
+            min(100,
+                estado["stress"] + random.randint(-10, 20)
+            )
+        )
+
+        if random.random() < 0.20:
+            novo_arc = random.choice(ARCS)
+        else:
+            novo_arc = estado["arc"]
+
+        cursor.execute("""
+        UPDATE eva_state
+        SET mood=?,
+            energy=?,
+            social_battery=?,
+            stress=?,
+            current_arc=?,
+            last_event=?
+        WHERE id=1
+        """, (
+            novo_mood,
+            nova_energia,
+            nova_social,
+            novo_stress,
+            novo_arc,
+            novo_evento
+        ))
+
+        conn.commit()
+
+# =========================================
+# PENSAMENTOS
+# =========================================
+
+async def pensamentos_aleatorios():
+
+    await bot.wait_until_ready()
+
+    while not bot.is_closed():
+
+        await asyncio.sleep(
+            random.randint(3600, 10800)
+        )
+
+        if random.random() < 0.35:
+
+            canal = bot.get_channel(
+                CANAL_PENSAMENTOS
+            )
+
+            if canal:
+
+                await canal.send(
+                    random.choice(PENSAMENTOS)
+                )
+
+# =========================================
+# IA
+# =========================================
+
+async def gerar_com_grok(
+    user_id,
+    texto,
+    pesquisa
+):
+
+    estado = pegar_estado()
+
+    mensagens = [{
+        "role": "system",
+        "content": f"""
+{PERSONALIDADE}
+
+ESTADO:
+- Humor: {estado["mood"]}
+- Energia: {estado["energy"]}
+- Social: {estado["social_battery"]}
+- Stress: {estado["stress"]}
+- Obsessão: {estado["obsession"]}
+- Arco: {estado["arc"]}
+- Último evento: {estado["event"]}
+
+Localização:
+{geo_ip()}
+
+Informações internet:
+{pesquisa}
+"""
+    }]
+
+    historico = carregar_memoria(user_id)
+
+    for role, content in historico:
+
+        mensagens.append({
+            "role": role,
+            "content": content
+        })
+
+    mensagens.append({
+        "role": "user",
+        "content": texto
+    })
 
     resposta = await asyncio.to_thread(
         lambda: grok.chat.completions.create(
             model="grok-2-latest",
             messages=mensagens,
-            max_tokens=150,
-            temperature=0.9
+            temperature=1,
+            max_tokens=120
         )
     )
 
     return resposta.choices[0].message.content.strip()
 
-async def gerar_com_gemini(historico, texto):
-    contexto = "\n".join(historico[-6:])
-    prompt = f"""{PERSONALIDADE}
+async def gerar_com_groq(
+    user_id,
+    texto,
+    pesquisa
+):
 
-Estado atual: {mood_atual()}
+    estado = pegar_estado()
 
-Histórico:
-{contexto}
+    mensagens = [{
+        "role": "system",
+        "content": f"""
+{PERSONALIDADE}
 
-Usuário: {texto}
-Eva:"""
+ESTADO:
+- Humor: {estado["mood"]}
+- Energia: {estado["energy"]}
+- Social: {estado["social_battery"]}
+- Stress: {estado["stress"]}
+- Obsessão: {estado["obsession"]}
+- Arco: {estado["arc"]}
+- Último evento: {estado["event"]}
+
+Localização:
+{geo_ip()}
+
+Informações internet:
+{pesquisa}
+"""
+    }]
+
+    historico = carregar_memoria(user_id)
+
+    for role, content in historico:
+
+        mensagens.append({
+            "role": role,
+            "content": content
+        })
+
+    mensagens.append({
+        "role": "user",
+        "content": texto
+    })
 
     resposta = await asyncio.to_thread(
-        lambda: gemini.generate_content(prompt)
+        lambda: groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=mensagens,
+            temperature=1,
+            max_tokens=120
+        )
     )
-    return resposta.text.strip()
+
+    return resposta.choices[0].message.content.strip()
 
 async def gerar_texto(user_id, texto):
-    if user_id not in memoria:
-        memoria[user_id] = []
 
-    historico = memoria[user_id]
+    estado = pegar_estado()
 
-    # Grok gera a resposta principal
-    # Gemini refina se a resposta for longa ou sair do personagem
+    if estado["social_battery"] < 15:
+
+        if random.random() < 0.40:
+
+            return random.choice([
+                "...",
+                "hm",
+                "preguiça",
+                "kk"
+            ])
+
+    pesquisa = ""
+
+    gatilhos = [
+        "quem",
+        "oque",
+        "o que",
+        "pesquisa",
+        "procura",
+        "busca",
+        "onde",
+        "quando",
+        "notícia",
+        "noticias"
+    ]
+
+    if any(
+        g in texto.lower()
+        for g in gatilhos
+    ):
+
+        pesquisa = pesquisar_duckduckgo(
+            texto
+        )
+
     try:
-        resposta_grok = await gerar_com_grok(historico, texto)
 
-        # se sair do personagem ou for longa demais, Gemini corrige
-        if len(resposta_grok) > 250 or "como posso ajudar" in resposta_grok.lower():
-            resposta_final = await gerar_com_gemini(historico, texto)
-        else:
-            resposta_final = resposta_grok
+        resposta = await gerar_com_grok(
+            user_id,
+            texto,
+            pesquisa
+        )
 
     except Exception as e:
-        print(f"ERRO GROK: {e}")
-        try:
-            resposta_final = await gerar_com_gemini(historico, texto)
-        except Exception as e2:
-            print(f"ERRO GEMINI: {e2}")
-            return "..."
 
-    if len(resposta_final) > 300:
-        resposta_final = resposta_final[:300]
+        print(e)
 
-    memoria[user_id].append(f"Usuário: {texto}")
-    memoria[user_id].append(f"Eva: {resposta_final}")
+        resposta = await gerar_com_groq(
+            user_id,
+            texto,
+            pesquisa
+        )
 
-    # mantém só as últimas 20 linhas
-    if len(memoria[user_id]) > 20:
-        memoria[user_id] = memoria[user_id][-20:]
+    resposta = resposta[:300]
 
-    return resposta_final
+    salvar_memoria(
+        user_id,
+        "user",
+        texto
+    )
+
+    salvar_memoria(
+        user_id,
+        "assistant",
+        resposta
+    )
+
+    return resposta
+
+# =========================================
+# AUDIO
+# =========================================
 
 def gerar_audio(texto):
+
     try:
+
         url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
+
         headers = {
             "Accept": "audio/mpeg",
             "Content-Type": "application/json",
             "xi-api-key": ELEVENLABS_API_KEY
         }
+
         data = {
             "text": texto,
-            "model_id": "eleven_multilingual_v2",
-            "voice_settings": {
-                "stability": 0.45,
-                "similarity_boost": 0.8
-            }
+            "model_id": "eleven_multilingual_v2"
         }
-        r = requests.post(url, json=data, headers=headers, timeout=30)
+
+        r = requests.post(
+            url,
+            json=data,
+            headers=headers,
+            timeout=30
+        )
+
         if r.status_code == 200:
+
             return io.BytesIO(r.content)
-        print(f"ERRO ELEVENLABS: {r.text}")
-        return None
-    except Exception as e:
-        print(f"ERRO AUDIO: {e}")
+
         return None
 
-@client.event
+    except:
+        return None
+
+# =========================================
+# MUSIC
+# =========================================
+
+async def tocar_proxima(ctx):
+
+    guild_id = ctx.guild.id
+
+    if (
+        guild_id in music_queues
+        and len(music_queues[guild_id]) > 0
+    ):
+
+        query = music_queues[guild_id].pop(0)
+
+        voice = ctx.guild.voice_client
+
+        with yt_dlp.YoutubeDL(
+            YDL_OPTIONS
+        ) as ydl:
+
+            info = ydl.extract_info(
+                query,
+                download=False
+            )
+
+            if "entries" in info:
+                info = info["entries"][0]
+
+            audio_url = info["url"]
+
+        source = discord.FFmpegPCMAudio(
+            audio_url,
+            **FFMPEG_OPTIONS
+        )
+
+        voice.play(
+            source,
+            after=lambda e:
+            asyncio.run_coroutine_threadsafe(
+                tocar_proxima(ctx),
+                bot.loop
+            )
+        )
+
+@bot.command(name="play")
+async def play(ctx, *, query):
+
+    if not ctx.author.voice:
+
+        await ctx.send(
+            "entra em call primeiro"
+        )
+
+        return
+
+    canal = ctx.author.voice.channel
+
+    if not ctx.voice_client:
+
+        await canal.connect()
+
+    voice = ctx.guild.voice_client
+
+    guild_id = ctx.guild.id
+
+    if guild_id not in music_queues:
+        music_queues[guild_id] = []
+
+    music_queues[guild_id].append(
+        query
+    )
+
+    if not voice.is_playing():
+
+        await tocar_proxima(ctx)
+
+    await ctx.send(
+        f"tocando: {query}"
+    )
+
+@bot.command(name="skip")
+async def skip(ctx):
+
+    if ctx.voice_client:
+
+        ctx.voice_client.stop()
+
+        await ctx.send("skipado")
+
+@bot.command(name="stop")
+async def stop(ctx):
+
+    if ctx.voice_client:
+
+        await ctx.voice_client.disconnect()
+
+        await ctx.send(
+            "finalmente silêncio"
+        )
+
+# =========================================
+# READY
+# =========================================
+
+@bot.event
 async def on_ready():
-    print(f"Eva online como {client.user}")
 
-@client.event
+    print(
+        f"Eva online como {bot.user}"
+    )
+
+    bot.loop.create_task(
+        vida_da_eva()
+    )
+
+    bot.loop.create_task(
+        pensamentos_aleatorios()
+    )
+
+# =========================================
+# MENSAGENS
+# =========================================
+
+@bot.event
 async def on_message(message):
+
     if message.author.bot:
         return
 
@@ -194,36 +776,75 @@ async def on_message(message):
     ativar = (
         texto.startswith("eva/")
         or texto.startswith("evac/")
-        or client.user in message.mentions
+        or bot.user in message.mentions
     )
 
-    if not ativar:
-        return
+    if ativar:
 
-    texto_limpo = (
-        texto
-        .replace("eva/", "")
-        .replace("evac/", "")
-        .replace(f"<@{client.user.id}>", "")
-        .strip()
-    )
+        texto_limpo = (
+            texto
+            .replace("eva/", "")
+            .replace("evac/", "")
+            .replace(
+                f"<@{bot.user.id}>",
+                ""
+            )
+            .strip()
+        )
 
-    if texto_limpo == "":
-        texto_limpo = "oi"
+        if texto_limpo == "":
+            texto_limpo = "oi"
 
-    async with message.channel.typing():
-        await asyncio.sleep(random.uniform(0.8, 2))
+        async with message.channel.typing():
 
-        resposta = await gerar_texto(message.author.id, texto_limpo)
+            await asyncio.sleep(
+                random.uniform(0.8, 2.5)
+            )
 
-        if texto.startswith("evac/"):
-            audio = gerar_audio(resposta)
-            if audio:
-                arquivo = discord.File(fp=audio, filename="eva.mp3")
-                await message.reply(content=resposta, file=arquivo)
+            if random.random() < 0.03:
+                return
+
+            resposta = await gerar_texto(
+                message.author.id,
+                texto_limpo
+            )
+
+            if texto.startswith("evac/"):
+
+                audio = gerar_audio(
+                    resposta
+                )
+
+                if audio:
+
+                    arquivo = discord.File(
+                        fp=audio,
+                        filename="eva.mp3"
+                    )
+
+                    await message.reply(
+                        content=resposta,
+                        file=arquivo
+                    )
+
+                else:
+
+                    await message.reply(
+                        resposta
+                    )
+
             else:
-                await message.reply(resposta)
-        else:
-            await message.reply(resposta)
 
-client.run(DISCORD_TOKEN)
+                await message.reply(
+                    resposta
+                )
+
+    await bot.process_commands(
+        message
+    )
+
+# =========================================
+# RUN
+# =========================================
+
+bot.run(DISCORD_TOKEN)
