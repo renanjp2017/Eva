@@ -6,6 +6,7 @@ import os
 import sqlite3
 import json
 import traceback
+import time
 
 from openai import OpenAI
 from groq import Groq
@@ -23,6 +24,9 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
 GROK_API_KEY = os.getenv("GROK_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
+# opcional: nome do modelo Grok primário (padrão)
+GROK_MODEL = os.getenv("GROK_MODEL", "grok-2-latest")
 
 LAVALINK_HOST = os.getenv("LAVALINK_HOST", "lavalink.railway.internal")
 LAVALINK_PORT = int(os.getenv("LAVALINK_PORT", "2333"))
@@ -57,7 +61,6 @@ _ready = False
 # DATABASE
 # =========================================
 
-# check_same_thread=False to allow access from async threads
 conn = sqlite3.connect("eva.db", check_same_thread=False)
 cursor = conn.cursor()
 
@@ -246,7 +249,7 @@ JSON:
         return {"intent":"chat","search":False}
 
 # =========================================
-# GROK FINAL (PERSONALITY ENGINE) - robust
+# GROK FINAL (PERSONALITY ENGINE) - robust with model fallback
 # =========================================
 
 async def grok_answer(uid, text, context):
@@ -271,23 +274,51 @@ CONTEXTO:
 
     messages.append({"role": "user", "content": text})
 
-    try:
-        r = await asyncio.to_thread(
-            lambda: grok.chat.completions.create(
-                model="grok-2-latest",
-                messages=messages,
-                temperature=1,
-                max_tokens=140
+    # modelos alternativos para fallback caso o primário não exista
+    candidate_models = [
+        GROK_MODEL,
+        "grok-2-latest",
+        "grok-1",
+        "gpt-4o-mini",
+        "gpt-4o"
+    ]
+
+    # remove duplicatas mantendo ordem
+    seen = set()
+    candidate_models = [m for m in candidate_models if not (m in seen or seen.add(m))]
+
+    last_exc = None
+    for model_name in candidate_models:
+        if not model_name:
+            continue
+        try:
+            r = await asyncio.to_thread(
+                lambda: grok.chat.completions.create(
+                    model=model_name,
+                    messages=messages,
+                    temperature=1,
+                    max_tokens=140
+                )
             )
-        )
-        ans = r.choices[0].message.content.strip()
-        if not ans:
-            return None
-        return ans
-    except Exception as e:
-        print("[GROK ERROR]", e)
-        traceback.print_exc()
-        return None
+            ans = r.choices[0].message.content.strip()
+            if ans:
+                return ans
+            # se resposta vazia, tenta próximo modelo
+            last_exc = None
+        except Exception as e:
+            last_exc = e
+            msg = str(e)
+            # log básico
+            print(f"[GROK ERROR] model={model_name} ->", msg)
+            # se for erro de modelo não encontrado, continua para o próximo
+            # caso contrário, também continua (tentativa resiliente)
+            traceback.print_exc()
+            await asyncio.sleep(0.2)  # pequena espera antes de tentar outro modelo
+
+    # se todos falharem, retorna None para que o fallback externo seja usado
+    if last_exc:
+        print("[GROK ALL MODELS FAILED]", last_exc)
+    return None
 
 # =========================================
 # FALLBACK (GROQ SIMPLE)
@@ -344,6 +375,27 @@ async def generate(uid, text):
 # MUSIC
 # =========================================
 
+async def ensure_pool_connected():
+    """
+    Garante que exista ao menos um node conectado no Pool.
+    Tenta conectar um node usando `uri` se Pool estiver vazio.
+    """
+    try:
+        nodes = getattr(wavelink.Pool, "nodes", None)
+        if not nodes or len(nodes) == 0:
+            print("[WAVELINK] Pool vazio, criando node...")
+            node = wavelink.Node(
+                uri=f"http://{LAVALINK_HOST}:{LAVALINK_PORT}",
+                password=LAVALINK_PASSWORD
+            )
+            await wavelink.Pool.connect(nodes=[node], client=bot)
+            # espera curto para estabilizar
+            await asyncio.sleep(0.5)
+            print("[WAVELINK] Pool conectado (ensure)")
+    except Exception as e:
+        print("[WAVELINK ENSURE ERROR]", e)
+        traceback.print_exc()
+
 @bot.command()
 async def play(ctx, *, search: str):
     if not ctx.author.voice:
@@ -353,25 +405,19 @@ async def play(ctx, *, search: str):
     player = ctx.voice_client
 
     try:
-        # se Pool não tem nodes conectados, tenta reconectar
-        if not getattr(wavelink.Pool, "nodes", None) or len(wavelink.Pool.nodes) == 0:
-            print("[MUSIC] Pool sem nodes, tentando reconectar...")
-            try:
-                node = wavelink.Node(
-                    host=LAVALINK_HOST,
-                    port=LAVALINK_PORT,
-                    password=LAVALINK_PASSWORD,
-                    rest_uri=f"http://{LAVALINK_HOST}:{LAVALINK_PORT}"
-                )
-                await wavelink.Pool.connect(nodes=[node], client=bot)
-                print("[MUSIC] Pool reconectado")
-            except Exception as e:
-                print("[MUSIC] falha ao reconectar Pool:", e)
-                traceback.print_exc()
+        await ensure_pool_connected()
 
         # conecta se não houver player ou não estiver conectado
         if not player or not getattr(player, "is_connected", lambda: False)():
-            player = await channel.connect(cls=wavelink.Player)
+            # se já existe um voice client em outro canal, desconecta primeiro
+            try:
+                player = await channel.connect(cls=wavelink.Player)
+            except Exception as e:
+                print("[MUSIC CONNECT ERROR]", e)
+                traceback.print_exc()
+                # tenta forçar reconexão do pool e reconectar
+                await ensure_pool_connected()
+                player = await channel.connect(cls=wavelink.Player)
 
         await ctx.send("procurando música...")
 
@@ -389,7 +435,7 @@ async def play(ctx, *, search: str):
         try:
             if ctx.voice_client and ctx.voice_client.is_connected():
                 await ctx.voice_client.disconnect()
-        except:
+        except Exception:
             pass
         await ctx.send("erro música")
 
@@ -437,11 +483,10 @@ async def on_ready():
     print("EVA ONLINE - on_ready")
 
     try:
+        # cria node usando uri (compatível com versões do wavelink)
         node = wavelink.Node(
-            host=LAVALINK_HOST,
-            port=LAVALINK_PORT,
-            password=LAVALINK_PASSWORD,
-            rest_uri=f"http://{LAVALINK_HOST}:{LAVALINK_PORT}"
+            uri=f"http://{LAVALINK_HOST}:{LAVALINK_PORT}",
+            password=LAVALINK_PASSWORD
         )
 
         await wavelink.Pool.connect(nodes=[node], client=bot)
