@@ -580,7 +580,6 @@ async def play(ctx, *, search: str):
         except Exception as e:
     print("VOICE ERROR:", repr(e))
     await ctx.send(f"erro voice: {repr(e)}")
-
             return
 
     await ctx.send("procurando música...")
