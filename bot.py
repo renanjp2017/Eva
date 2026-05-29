@@ -1,3 +1,7 @@
+# =========================================
+# EVA DISCORD BOT v2 - FIXED FOR RAILWAY
+# =========================================
+
 import discord
 import wavelink
 import random
@@ -25,7 +29,7 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GROK_API_KEY = os.getenv("GROK_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# opcional: nome do modelo Grok primário (padrão)
+# Modelo Grok primário (defina via env se necessário)
 GROK_MODEL = os.getenv("GROK_MODEL", "grok-2-latest")
 
 LAVALINK_HOST = os.getenv("LAVALINK_HOST", "lavalink.railway.internal")
@@ -87,7 +91,7 @@ last_event TEXT
 conn.commit()
 
 # =========================================
-# PERSONALIDADE FORTE (ESSENCIAL)
+# PERSONALIDADE
 # =========================================
 
 PERSONALITY = """
@@ -203,7 +207,7 @@ def ddg(query):
         return ""
 
 # =========================================
-# INTENT (GROQ ROUTER) - robust parsing
+# INTENT (GROQ ROUTER)
 # =========================================
 
 async def get_intent(text):
@@ -227,12 +231,10 @@ JSON:
             )
         )
         raw = r.choices[0].message.content
-        # tenta parsear JSON do retorno
         try:
             parsed = json.loads(raw)
             return parsed
         except:
-            # tenta extrair JSON dentro do texto
             start = raw.find('{')
             end = raw.rfind('}') + 1
             if start != -1 and end != -1:
@@ -241,7 +243,6 @@ JSON:
                     return parsed
                 except:
                     pass
-        # fallback seguro
         return {"intent":"chat","search":False}
     except Exception as e:
         print("[INTENT ERROR]", e)
@@ -249,7 +250,7 @@ JSON:
         return {"intent":"chat","search":False}
 
 # =========================================
-# GROK FINAL (PERSONALITY ENGINE) - robust with model fallback
+# GROK FINAL (PERSONALITY ENGINE) - single-model attempt then fallback
 # =========================================
 
 async def grok_answer(uid, text, context):
@@ -274,51 +275,28 @@ CONTEXTO:
 
     messages.append({"role": "user", "content": text})
 
-    # modelos alternativos para fallback caso o primário não exista
-    candidate_models = [
-        GROK_MODEL,
-        "grok-2-latest",
-        "grok-1",
-        "gpt-4o-mini",
-        "gpt-4o"
-    ]
+    # Tenta apenas o modelo configurado em GROK_MODEL.
+    # Se falhar (modelo inexistente ou erro), retorna None para usar fallback.
+    if not GROK_API_KEY:
+        print("[GROK SKIP] GROK_API_KEY not set")
+        return None
 
-    # remove duplicatas mantendo ordem
-    seen = set()
-    candidate_models = [m for m in candidate_models if not (m in seen or seen.add(m))]
-
-    last_exc = None
-    for model_name in candidate_models:
-        if not model_name:
-            continue
-        try:
-            r = await asyncio.to_thread(
-                lambda: grok.chat.completions.create(
-                    model=model_name,
-                    messages=messages,
-                    temperature=1,
-                    max_tokens=140
-                )
+    try:
+        r = await asyncio.to_thread(
+            lambda: grok.chat.completions.create(
+                model=GROK_MODEL,
+                messages=messages,
+                temperature=1,
+                max_tokens=140
             )
-            ans = r.choices[0].message.content.strip()
-            if ans:
-                return ans
-            # se resposta vazia, tenta próximo modelo
-            last_exc = None
-        except Exception as e:
-            last_exc = e
-            msg = str(e)
-            # log básico
-            print(f"[GROK ERROR] model={model_name} ->", msg)
-            # se for erro de modelo não encontrado, continua para o próximo
-            # caso contrário, também continua (tentativa resiliente)
-            traceback.print_exc()
-            await asyncio.sleep(0.2)  # pequena espera antes de tentar outro modelo
-
-    # se todos falharem, retorna None para que o fallback externo seja usado
-    if last_exc:
-        print("[GROK ALL MODELS FAILED]", last_exc)
-    return None
+        )
+        ans = r.choices[0].message.content.strip()
+        return ans if ans else None
+    except Exception as e:
+        # Se o erro for "Model not found" ou qualquer outro, logamos e retornamos None
+        print(f"[GROK ERROR] model={GROK_MODEL} ->", e)
+        traceback.print_exc()
+        return None
 
 # =========================================
 # FALLBACK (GROQ SIMPLE)
@@ -341,7 +319,7 @@ async def fallback(text):
         return "..."
 
 # =========================================
-# PIPELINE PRINCIPAL (ARQUITETURA LIMPA)
+# PIPELINE PRINCIPAL
 # =========================================
 
 async def generate(uid, text):
@@ -356,14 +334,11 @@ async def generate(uid, text):
     if needs_search:
         context = ddg(text)
 
-    # 1. GROK PRIME
     response = await grok_answer(uid, text, context)
 
-    # 2. FALLBACK CASCATA
     if not response:
         response = await fallback(text)
 
-    # só salva se houver texto/resposta válidos
     if text:
         save_memory(uid, "user", text)
     if response:
@@ -372,14 +347,10 @@ async def generate(uid, text):
     return response or "..."
 
 # =========================================
-# MUSIC
+# MUSIC (WAVELINK)
 # =========================================
 
 async def ensure_pool_connected():
-    """
-    Garante que exista ao menos um node conectado no Pool.
-    Tenta conectar um node usando `uri` se Pool estiver vazio.
-    """
     try:
         nodes = getattr(wavelink.Pool, "nodes", None)
         if not nodes or len(nodes) == 0:
@@ -389,7 +360,6 @@ async def ensure_pool_connected():
                 password=LAVALINK_PASSWORD
             )
             await wavelink.Pool.connect(nodes=[node], client=bot)
-            # espera curto para estabilizar
             await asyncio.sleep(0.5)
             print("[WAVELINK] Pool conectado (ensure)")
     except Exception as e:
@@ -407,15 +377,12 @@ async def play(ctx, *, search: str):
     try:
         await ensure_pool_connected()
 
-        # conecta se não houver player ou não estiver conectado
         if not player or not getattr(player, "is_connected", lambda: False)():
-            # se já existe um voice client em outro canal, desconecta primeiro
             try:
                 player = await channel.connect(cls=wavelink.Player)
             except Exception as e:
                 print("[MUSIC CONNECT ERROR]", e)
                 traceback.print_exc()
-                # tenta forçar reconexão do pool e reconectar
                 await ensure_pool_connected()
                 player = await channel.connect(cls=wavelink.Player)
 
@@ -431,11 +398,10 @@ async def play(ctx, *, search: str):
     except Exception as e:
         print("[MUSIC ERROR]", e)
         traceback.print_exc()
-        # tenta desconectar com segurança se estiver conectado
         try:
             if ctx.voice_client and ctx.voice_client.is_connected():
                 await ctx.voice_client.disconnect()
-        except Exception:
+        except:
             pass
         await ctx.send("erro música")
 
@@ -483,7 +449,6 @@ async def on_ready():
     print("EVA ONLINE - on_ready")
 
     try:
-        # cria node usando uri (compatível com versões do wavelink)
         node = wavelink.Node(
             uri=f"http://{LAVALINK_HOST}:{LAVALINK_PORT}",
             password=LAVALINK_PASSWORD
@@ -495,11 +460,10 @@ async def on_ready():
         print("[LAVALINK CONNECT ERROR]", e)
         traceback.print_exc()
 
-    # start life loop
     asyncio.create_task(loop())
 
 # =========================================
-# LOOP (VIDA SIMPLES)
+# LOOP
 # =========================================
 
 async def loop():
@@ -542,7 +506,6 @@ async def on_message(message):
             traceback.print_exc()
             resp = "..."
 
-    # garante que sempre haja uma string
     if not resp:
         resp = "..."
 
