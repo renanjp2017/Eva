@@ -276,11 +276,12 @@ vcs     = {}   # guild_id -> VoiceClient
 tocando = {}   # guild_id -> titulo
 
 YTDL_OPTS = {
-    "format": "bestaudio/best",
+    "format": "bestaudio/best[ext=webm]/bestaudio/best",
+    "ignoreerrors": True,
     "quiet": True,
     "no_warnings": True,
     "nocheckcertificate": True,
-    "extractor_args": {"youtube": {"player_client": ["ios", "mweb"]}},
+    "extractor_args": {"youtube": {"player_client": ["ios", "mweb", "web"]}},
 }
 
 FFMPEG_OPTS = {
