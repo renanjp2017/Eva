@@ -1,8 +1,9 @@
-discord.py[voice]
+discord.py
+python-dotenv
 openai
 groq
-python-dotenv
-requests
 duckduckgo-search
+requests
+yt-dlp
 PyNaCl
-wavelink
+ffmpeg-python
