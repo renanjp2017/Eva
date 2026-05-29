@@ -1,9 +1,10 @@
-discord.py
+discord.py==2.4.0
 python-dotenv
 openai
 groq
 duckduckgo-search
 requests
 yt-dlp
-PyNaCl
+PyNaCl==1.5.0
 ffmpeg-python
+audioop-lts
