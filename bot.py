@@ -1,3 +1,7 @@
+# =========================================
+# EVA DISCORD BOT
+# =========================================
+
 import discord
 import io
 import random
@@ -5,7 +9,7 @@ import asyncio
 import os
 import sqlite3
 import requests
-import yt_dlp
+import wavelink
 
 from openai import OpenAI
 from groq import Groq
@@ -29,6 +33,14 @@ ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")
 
 CANAL_PENSAMENTOS = int(
     os.getenv("CANAL_PENSAMENTOS", "0")
+)
+
+LAVALINK_URI = os.getenv(
+    "LAVALINK_URI"
+)
+
+LAVALINK_PASSWORD = os.getenv(
+    "LAVALINK_PASSWORD"
 )
 
 # =========================================
@@ -158,40 +170,6 @@ PENSAMENTOS = [
     "muita gente falando hj",
     "queria dormir por 12h"
 ]
-
-# =========================================
-# YOUTUBE / MUSIC
-# =========================================
-
-music_queues = {}
-
-YDL_OPTIONS = {
-    "format": "bestaudio/best",
-    "noplaylist": True,
-    "quiet": True,
-    "extract_flat": False,
-    "default_search": "ytsearch1",
-    "source_address": "0.0.0.0",
-
-    "http_headers": {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-        )
-    },
-
-    "extractor_args": {
-        "youtube": {
-            "player_client": [
-                "android",
-                "web"
-            ]
-        }
-    }
-}
-
-FFMPEG_OPTIONS = {
-    "options": "-vn"
-}
 
 # =========================================
 # ESTADO
@@ -489,61 +467,6 @@ Informações internet:
 
     return resposta.choices[0].message.content.strip()
 
-async def gerar_com_groq(
-    user_id,
-    texto,
-    pesquisa
-):
-
-    estado = pegar_estado()
-
-    mensagens = [{
-        "role": "system",
-        "content": f"""
-{PERSONALIDADE}
-
-ESTADO:
-- Humor: {estado["mood"]}
-- Energia: {estado["energy"]}
-- Social: {estado["social_battery"]}
-- Stress: {estado["stress"]}
-- Obsessão: {estado["obsession"]}
-- Arco: {estado["arc"]}
-- Último evento: {estado["event"]}
-
-Localização:
-{geo_ip()}
-
-Informações internet:
-{pesquisa}
-"""
-    }]
-
-    historico = carregar_memoria(user_id)
-
-    for role, content in historico:
-
-        mensagens.append({
-            "role": role,
-            "content": content
-        })
-
-    mensagens.append({
-        "role": "user",
-        "content": texto
-    })
-
-    resposta = await asyncio.to_thread(
-        lambda: groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=mensagens,
-            temperature=1,
-            max_tokens=120
-        )
-    )
-
-    return resposta.choices[0].message.content.strip()
-
 async def gerar_texto(user_id, texto):
 
     estado = pegar_estado()
@@ -595,11 +518,7 @@ async def gerar_texto(user_id, texto):
 
         print(e)
 
-        resposta = await gerar_com_groq(
-            user_id,
-            texto,
-            pesquisa
-        )
+        resposta = "..."
 
     resposta = resposta[:300]
 
@@ -655,97 +574,50 @@ def gerar_audio(texto):
         return None
 
 # =========================================
-# MUSIC
+# LAVALINK READY
 # =========================================
 
-async def tocar_proxima(ctx):
+@bot.event
+async def on_ready():
 
-    guild_id = ctx.guild.id
-
-    if (
-        guild_id not in music_queues
-        or len(music_queues[guild_id]) == 0
-    ):
-        return
-
-    query = music_queues[guild_id].pop(0)
-
-    voice = ctx.guild.voice_client
+    print(
+        f"Eva online como {bot.user}"
+    )
 
     try:
 
-        with yt_dlp.YoutubeDL(
-            YDL_OPTIONS
-        ) as ydl:
-
-            info = ydl.extract_info(
-                query,
-                download=False
+        nodes = [
+            wavelink.Node(
+                uri=LAVALINK_URI,
+                password=LAVALINK_PASSWORD
             )
+        ]
 
-            if not info:
-
-                await ctx.send(
-                    "n achei essa porra"
-                )
-
-                return
-
-            if "entries" in info:
-
-                if len(info["entries"]) == 0:
-
-                    await ctx.send(
-                        "youtube fingiu q n existe"
-                    )
-
-                    return
-
-                info = info["entries"][0]
-
-            audio_url = info.get("url")
-
-            if not audio_url:
-
-                await ctx.send(
-                    "youtube cagou o link"
-                )
-
-                return
-
-        source = discord.FFmpegPCMAudio(
-            audio_url,
-            **FFMPEG_OPTIONS
+        await wavelink.Pool.connect(
+            nodes=nodes,
+            client=bot
         )
 
-        voice.play(
-            source,
-            after=lambda e:
-            asyncio.run_coroutine_threadsafe(
-                tocar_proxima(ctx),
-                bot.loop
-            )
-        )
-
-        titulo = info.get(
-            "title",
-            "musica estranha"
-        )
-
-        await ctx.send(
-            f"tocando agr: {titulo}"
-        )
+        print("Lavalink conectado")
 
     except Exception as e:
 
-        print(f"ERRO PLAY: {e}")
+        print(f"ERRO LAVALINK: {e}")
 
-        await ctx.send(
-            "youtube surtou dnv"
-        )
+    bot.loop.create_task(
+        vida_da_eva()
+    )
+
+    bot.loop.create_task(
+        pensamentos_aleatorios()
+    )
+
+# =========================================
+# PLAY
+# =========================================
 
 @bot.command(name="play")
-async def play(ctx, *, query):
+async def play(ctx, *, search):
 
     if not ctx.author.voice:
 
@@ -755,37 +627,56 @@ async def play(ctx, *, query):
 
         return
 
-    canal = ctx.author.voice.channel
+    channel = ctx.author.voice.channel
 
-    if not ctx.voice_client:
+    player = ctx.voice_client
 
-        await canal.connect()
+    if not player:
 
-    voice = ctx.guild.voice_client
+        player = await channel.connect(
+            cls=wavelink.Player
+        )
 
-    guild_id = ctx.guild.id
-
-    if guild_id not in music_queues:
-        music_queues[guild_id] = []
-
-    music_queues[guild_id].append(
-        query
+    tracks = await wavelink.Playable.search(
+        search
     )
 
-    if not voice.is_playing():
+    if not tracks:
 
-        await tocar_proxima(ctx)
+        await ctx.send(
+            "n achei isso"
+        )
+
+        return
+
+    track = tracks[0]
+
+    await player.play(track)
+
+    await ctx.send(
+        f"tocando: {track.title}"
+    )
+
+# =========================================
+# SKIP
+# =========================================
 
 @bot.command(name="skip")
 async def skip(ctx):
 
-    if ctx.voice_client:
+    player = ctx.voice_client
 
-        ctx.voice_client.stop()
+    if player:
+
+        await player.skip()
 
         await ctx.send(
-            "skipado"
+            "pulada"
         )
+
+# =========================================
+# STOP
+# =========================================
 
 @bot.command(name="stop")
 async def stop(ctx):
@@ -799,26 +690,7 @@ async def stop(ctx):
         )
 
 # =========================================
-# READY
-# =========================================
-
-@bot.event
-async def on_ready():
-
-    print(
-        f"Eva online como {bot.user}"
-    )
-
-    bot.loop.create_task(
-        vida_da_eva()
-    )
-
-    bot.loop.create_task(
-        pensamentos_aleatorios()
-    )
-
-# =========================================
-# MENSAGENS
+# CHAT
 # =========================================
 
 @bot.event
