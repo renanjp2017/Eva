@@ -1,10 +1,6 @@
-FROM python:3.11-slim
+FROM fredboat/lavalink:v4.0.5
 
-WORKDIR /app
+# Copia o seu arquivo de configuração para dentro do servidor
+COPY application.yml /opt/Lavalink/application.yml
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-COPY bot.py .
-
-CMD ["python", "-u", "bot.py"]
+ENV _JAVA_OPTIONS="-Xmx1G"
