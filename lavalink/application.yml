@@ -26,9 +26,9 @@ lavalink:
 plugins:
   youtube:
     enabled: true
-    allowSearch: false
-    allowDirectVideoIds: false
-    allowDirectPlaylistIds: false
+    allowSearch: true
+    allowDirectVideoIds: true
+    allowDirectPlaylistIds: true
     clients:
       - MUSIC
       - WEB
@@ -36,11 +36,12 @@ plugins:
     providers:
       - "dzsearch:%QUERY%"
       - "scsearch:%QUERY%"
+      - "ytsearch:%QUERY%"
     sources:
       spotify: false
       applemusic: false
       deezer: true
       yandexmusic: false
-      youtube: false
+      youtube: true
     deezer:
       masterDecryptionKey: "2a83bf1aeb2d4c3f3b37d7a0a670c3c7f0d8f2f2e2d5e4b4f1d3e0c9a8f2b4"
