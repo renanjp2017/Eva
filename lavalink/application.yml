@@ -1,8 +1,4 @@
 lavalink:
-  plugins:
-    - dependency: "com.github.topi314.lavasrc:lavasrc-plugin:4.3.0"
-      repository: "https://maven.lavalink.dev/releases"
-      snapshot: false
   server:
     password: "youshallnotpass"
     sources:
@@ -13,18 +9,6 @@ lavalink:
       vimeo: true
       http: true
       local: false
-  pluginsConfig:
-    lavasrc:
-      providers:
-        - "dzisrc:%ISRC%"
-        - "dzsearch:%QUERY%"
-      sources:
-        spotify: false
-        applemusic: false
-        deezer: true
-        yandexmusic: false
-        flowerytts: false
-        youtube: false
 
 server:
   port: 2333
