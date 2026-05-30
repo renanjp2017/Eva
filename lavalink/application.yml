@@ -1,4 +1,13 @@
+server:
+  port: 2333
+  address: 0.0.0.0
+
 lavalink:
+  plugins:
+    - dependency: "com.github.topi314.lavasrc:lavasrc-plugin:4.3.0"
+      snapshot: false
+    - dependency: "com.github.topi314.lavalyrics:lavalyrics-plugin:1.0.0"
+      snapshot: false
   server:
     password: "youshallnotpass"
     sources:
@@ -9,7 +18,26 @@ lavalink:
       vimeo: true
       http: true
       local: false
+    bufferDurationMs: 400
+    frameBufferDurationMs: 5000
+    youtubePlaylistLoadLimit: 6
+    playerUpdateInterval: 5
+    youtubeSearchEnabled: true
+    soundcloudSearchEnabled: true
+    gc-warnings: true
 
-server:
-  port: 2333
-  address: 0.0.0.0
+plugins:
+  lavasrc:
+    providers:
+      - "ytsearch:\"%ISRC%\""
+      - "ytsearch:%QUERY%"
+      - "scsearch:%QUERY%"
+    sources:
+      spotify: false
+      applemusic: false
+      deezer: true
+      yandexmusic: false
+      flowerytts: false
+      youtube: true
+    deezer:
+      masterDecryptionKey: "2a83bf1aeb2d4c3f3b37d7a0a670c3c7f0d8f2f2e2d5e4b4f1d3e0c9a8f2b4"
