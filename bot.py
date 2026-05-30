@@ -5,6 +5,7 @@ import asyncio
 import os
 import json
 import re
+import wavelink
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -20,10 +21,6 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 grok_client = OpenAI(api_key=GROK_API_KEY, base_url="https://api.x.ai/v1")
 groq_client = OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
-
-intents = discord.Intents.default()
-intents.message_content = True
-client = discord.Client(intents=intents)
 
 # =========================================
 # MEMÓRIA RICA (JSON)
@@ -100,7 +97,7 @@ def montar_contexto_usuario(user_id):
     return " | ".join(partes) if partes else "pessoa nova"
 
 # =========================================
-# SISTEMA TAMAGOTCHI (ESTADO/HUMOR)
+# SISTEMA TAMAGOTCHI
 # =========================================
 estado_atual = {"humor": "neutra", "evento": None, "evento_expira": None}
 
@@ -152,7 +149,7 @@ async def classificar_intencao(texto):
     Mensagem: "{texto}"
     
     Regras:
-    - "intent": "music" se o usuário quer tocar, parar ou pular música (ex: play, music, m!play, m!skip).
+    - "intent": "music" se o usuário quer tocar, parar ou pular música (ex: play, music, m!play, m!skip, toca, pula).
     - "intent": "search" se o usuário faz uma pergunta factual ou busca notícia.
     - "intent": "chat" para conversa normal.
     - "action": "play", "skip", "stop" (apenas se intent for music), senão "none".
@@ -236,81 +233,120 @@ async def gerar_resposta(user_id, intent_data, contexto_extra=""):
         print(f"[ERRO GROK]: {e}")
         return random.choice(["hm", "aff", "q", "me deixa em paz", "tá"])
 
+
 # =========================================
-# EVENTOS DO DISCORD
+# CLIENTE DISCORD COM WAVELINK (LAVALINK)
 # =========================================
-@client.event
-async def on_ready():
-    print(f"🔥 Eva online como {client.user}")
+class EvaBot(discord.Client):
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.message_content = True
+        super().__init__(intents=intents)
 
-@client.event
-async def on_message(message):
-    if message.author.bot:
-        return
+    async def setup_hook(self):
+        # Conecta ao Node do Lavalink que está rodando no Docker
+        # O host "lavalink" resolve automaticamente dentro da rede do Docker Compose
+        nodes = [wavelink.Node(uri="http://lavalink:2333", password="youshallnotpass")]
+        await wavelink.Pool.connect(nodes=nodes, client=self, cache_capacity=100)
 
-    texto = message.content.strip()
-    texto_lower = texto.lower()
-    
-    # ── GATILHOS DE ATIVAÇÃO NATURAL ──
-    is_mentioned = client.user in message.mentions
-    has_name = bool(re.search(r'\beva\b', texto_lower))
-    # Ajustado para pegar "m!", ".skip", etc.
-    is_music = texto_lower.startswith(("play ", "music ", "m!", ".skip", ".stop", ".play"))
-    
-    if not (is_mentioned or has_name or is_music):
-        return
+    async def on_ready(self):
+        print(f"🔥 Eva online como {self.user} e conectada ao Lavalink!")
 
-    u = get_usuario(message.author.id)
-    if not u["nome"]: u["nome"] = message.author.display_name
+    async def on_wavelink_track_end(self, payload: wavelink.TrackEndEventPayload):
+        # Toca a próxima música da fila se houver
+        if not payload.player.queue.is_empty:
+            next_track = payload.player.queue.get()
+            await payload.player.play(next_track)
 
-    texto_limpo = texto.replace(f"<@{client.user.id}>", "").strip()
+    async def on_message(self, message):
+        if message.author.bot:
+            return
 
-    async with message.channel.typing():
-        await asyncio.sleep(random.uniform(0.8, 1.5))
+        texto = message.content.strip()
+        texto_lower = texto.lower()
         
-        # 1. Roteador
-        intent_data = await classificar_intencao(texto_limpo)
-        intent = intent_data.get("intent", "chat")
-        action = intent_data.get("action", "none")
-        query = intent_data.get("query", texto_limpo)
+        is_mentioned = self.user in message.mentions
+        has_name = bool(re.search(r'\beva\b', texto_lower))
+        is_music = texto_lower.startswith(("play ", "music ", "m!", "toca ", "pula", ".skip", ".stop", ".play"))
         
-        contexto_extra = ""
-        comando_jockie = ""
+        if not (is_mentioned or has_name or is_music):
+            return
 
-        # 2. Direcionamento Invisível
-        if intent == "search":
-            busca = buscar_duckduckgo(query)
-            if busca: contexto_extra = f"Resultado do DuckDuckGo: {busca}"
+        u = get_usuario(message.author.id)
+        if not u["nome"]: u["nome"] = message.author.display_name
+
+        texto_limpo = texto.replace(f"<@{self.user.id}>", "").strip()
+
+        async with message.channel.typing():
+            await asyncio.sleep(random.uniform(0.8, 1.5))
             
-        elif intent == "music":
-            # Aqui configuramos o comando com o prefixo exato do Jockie
-            if action == "play":
-                comando_jockie = f"m!play {query}"
-                contexto_extra = f"[O usuário pediu pra tocar '{query}'. Vc já deu o play, tire sarro do gosto dele.]"
-            elif action == "skip":
-                comando_jockie = "m!skip"
-                contexto_extra = "[Você acabou de pular a música, diga algo sobre como estava insuportável.]"
-            elif action == "stop":
-                comando_jockie = "m!stop"
-                contexto_extra = "[Você parou a música, diga que não aguentava mais.]"
-
-        # 3. Geração da Mensagem da Persona
-        resposta = await gerar_resposta(message.author.id, intent_data, contexto_extra)
-        
-        # 4. TRUQUE MÁGICO: Envia o comando e apaga em 0.5 segundos
-        if comando_jockie:
-            try:
-                msg_comando = await message.channel.send(comando_jockie)
-                await asyncio.sleep(0.5) # O tempo exato pro Jockie ler antes de sumir
-                await msg_comando.delete()
-            except Exception as e:
-                print(f"[ERRO AO APAGAR COMANDO]: {e}")
+            # 1. Roteador
+            intent_data = await classificar_intencao(texto_limpo)
+            intent = intent_data.get("intent", "chat")
+            action = intent_data.get("action", "none")
+            query = intent_data.get("query", texto_limpo)
             
-        # 5. Salva memórias
-        atualizar_memoria_usuario(message.author.id, texto_limpo, resposta)
-        salvar_memoria()
-        
-        # 6. Responde ao usuário com a mensagem real
-        await message.reply(resposta)
+            contexto_extra = ""
 
+            # 2. Direcionamento e Execução
+            if intent == "search":
+                busca = buscar_duckduckgo(query)
+                if busca: contexto_extra = f"Resultado do DuckDuckGo: {busca}"
+                
+            elif intent == "music":
+                voice_state = message.author.voice
+                
+                # Impede o wavelink de dar erro se o cara pedir música fora do canal
+                if not voice_state:
+                    contexto_extra = "[O usuário pediu música, mas não está num canal de voz. Ofenda a falta de inteligência dele.]"
+                else:
+                    vc: wavelink.Player = message.guild.voice_client
+                    if not vc:
+                        vc = await voice_state.channel.connect(cls=wavelink.Player)
+                    
+                    if action == "play":
+                        try:
+                            # Prefixo 'dzsearch:' ativa a pesquisa no Deezer pelo LavaSrc
+                            tracks = await wavelink.Playable.search(f"dzsearch:{query}")
+                            if not tracks:
+                                contexto_extra = f"[Você tentou tocar '{query}', mas não achou NADA no Deezer. Zombe dele por ouvir música esquisita que nem existe.]"
+                            else:
+                                track = tracks[0]
+                                await vc.queue.put_wait(track)
+                                
+                                # Se o bot não estiver tocando nada, inicia o som
+                                if not vc.playing:
+                                    await vc.play(vc.queue.get())
+                                
+                                contexto_extra = f"[Você acabou de colocar a música '{track.title}' na fila. Reclame como essa música é ruim e julgue o gosto musical dele.]"
+                        except Exception as e:
+                            print(f"[ERRO LAVALINK]: {e}")
+                            contexto_extra = "[Ocorreu um erro no servidor de som. Fique irritada com a tecnologia e xingue o bot de música.]"
+
+                    elif action == "skip":
+                        if vc and vc.playing:
+                            await vc.skip(force=True)
+                            contexto_extra = "[Você pulou a música atual. Reclame que estava insuportável e que ele tem um gosto terrível.]"
+                        else:
+                            contexto_extra = "[O usuário pediu pra pular música, mas não tem NADA tocando. Chame ele de esquizofrênico.]"
+
+                    elif action == "stop":
+                        if vc:
+                            await vc.disconnect()
+                            contexto_extra = "[Você parou a música, desconectou do canal de voz e disse que finalmente tem paz.]"
+                        else:
+                            contexto_extra = "[O usuário pediu pra parar a música, mas você nem tava lá. Deboche da cara dele.]"
+
+            # 3. Geração da Mensagem da Persona
+            resposta = await gerar_resposta(message.author.id, intent_data, contexto_extra)
+                
+            # 4. Salva memórias
+            atualizar_memoria_usuario(message.author.id, texto_limpo, resposta)
+            salvar_memoria()
+            
+            # 5. Responde ao usuário
+            await message.reply(resposta)
+
+# Iniciar
+client = EvaBot()
 client.run(DISCORD_TOKEN)
