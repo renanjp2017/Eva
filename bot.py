@@ -362,15 +362,24 @@ class Eva(discord.Client):
         super().__init__(intents=intents)
 
     async def setup_hook(self):
-        # Inicializa humor na subida
         inicializar_humor_diario()
-        # Inicia scheduler
         asyncio.create_task(scheduler_humor())
-        # Conecta Lavalink
+        asyncio.create_task(self._conectar_lavalink())
+
+    async def _conectar_lavalink(self):
         uri = os.getenv("LAVALINK_URI", "http://localhost:2333")
         pwd = os.getenv("LAVALINK_PASSWORD", "youshallnotpass")
-        nodes = [wavelink.Node(uri=uri, password=pwd)]
-        await wavelink.Pool.connect(nodes=nodes, client=self, cache_capacity=100)
+        await asyncio.sleep(5)
+        for tentativa in range(1, 13):
+            try:
+                nodes = [wavelink.Node(uri=uri, password=pwd)]
+                await wavelink.Pool.connect(nodes=nodes, client=self, cache_capacity=100)
+                print(f"[LAVALINK] Conectado na tentativa {tentativa}")
+                return
+            except Exception as e:
+                print(f"[LAVALINK] Tentativa {tentativa}/12 falhou: {e}")
+                await asyncio.sleep(10)
+        print("[LAVALINK] Desistiu após 12 tentativas.")
 
     async def on_ready(self):
         preset = humor_state.get("preset_nome", "?")
