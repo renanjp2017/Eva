@@ -23,9 +23,10 @@ grok_client = OpenAI(api_key=GROK_API_KEY, base_url="https://api.x.ai/v1")
 groq_client = OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
 
 # =========================================
-# MEMÓRIA RICA (JSON)
+# MEMÓRIA RICA (JSON) PARA O RAILWAY
 # =========================================
-MEMORIA_FILE = "memoria.json"
+os.makedirs("data", exist_ok=True) # Cria a pasta de dados se não existir
+MEMORIA_FILE = "data/memoria.json" # Salva no volume do Railway
 
 def carregar_memoria():
     try:
@@ -233,7 +234,6 @@ async def gerar_resposta(user_id, intent_data, contexto_extra=""):
         print(f"[ERRO GROK]: {e}")
         return random.choice(["hm", "aff", "q", "me deixa em paz", "tá"])
 
-
 # =========================================
 # CLIENTE DISCORD COM WAVELINK (LAVALINK)
 # =========================================
@@ -244,16 +244,15 @@ class EvaBot(discord.Client):
         super().__init__(intents=intents)
 
     async def setup_hook(self):
-        # Conecta ao Node do Lavalink que está rodando no Docker
-        # O host "lavalink" resolve automaticamente dentro da rede do Docker Compose
-        nodes = [wavelink.Node(uri="http://lavalink:2333", password="youshallnotpass")]
+        # Puxa a URL do Lavalink do Railway
+        lavalink_uri = os.getenv("LAVALINK_URI", "http://localhost:2333")
+        nodes = [wavelink.Node(uri=lavalink_uri, password="youshallnotpass")]
         await wavelink.Pool.connect(nodes=nodes, client=self, cache_capacity=100)
 
     async def on_ready(self):
         print(f"🔥 Eva online como {self.user} e conectada ao Lavalink!")
 
     async def on_wavelink_track_end(self, payload: wavelink.TrackEndEventPayload):
-        # Toca a próxima música da fila se houver
         if not payload.player.queue.is_empty:
             next_track = payload.player.queue.get()
             await payload.player.play(next_track)
@@ -280,7 +279,6 @@ class EvaBot(discord.Client):
         async with message.channel.typing():
             await asyncio.sleep(random.uniform(0.8, 1.5))
             
-            # 1. Roteador
             intent_data = await classificar_intencao(texto_limpo)
             intent = intent_data.get("intent", "chat")
             action = intent_data.get("action", "none")
@@ -288,7 +286,6 @@ class EvaBot(discord.Client):
             
             contexto_extra = ""
 
-            # 2. Direcionamento e Execução
             if intent == "search":
                 busca = buscar_duckduckgo(query)
                 if busca: contexto_extra = f"Resultado do DuckDuckGo: {busca}"
@@ -296,7 +293,6 @@ class EvaBot(discord.Client):
             elif intent == "music":
                 voice_state = message.author.voice
                 
-                # Impede o wavelink de dar erro se o cara pedir música fora do canal
                 if not voice_state:
                     contexto_extra = "[O usuário pediu música, mas não está num canal de voz. Ofenda a falta de inteligência dele.]"
                 else:
@@ -306,7 +302,6 @@ class EvaBot(discord.Client):
                     
                     if action == "play":
                         try:
-                            # Prefixo 'dzsearch:' ativa a pesquisa no Deezer pelo LavaSrc
                             tracks = await wavelink.Playable.search(f"dzsearch:{query}")
                             if not tracks:
                                 contexto_extra = f"[Você tentou tocar '{query}', mas não achou NADA no Deezer. Zombe dele por ouvir música esquisita que nem existe.]"
@@ -314,7 +309,6 @@ class EvaBot(discord.Client):
                                 track = tracks[0]
                                 await vc.queue.put_wait(track)
                                 
-                                # Se o bot não estiver tocando nada, inicia o som
                                 if not vc.playing:
                                     await vc.play(vc.queue.get())
                                 
@@ -337,16 +331,12 @@ class EvaBot(discord.Client):
                         else:
                             contexto_extra = "[O usuário pediu pra parar a música, mas você nem tava lá. Deboche da cara dele.]"
 
-            # 3. Geração da Mensagem da Persona
             resposta = await gerar_resposta(message.author.id, intent_data, contexto_extra)
                 
-            # 4. Salva memórias
             atualizar_memoria_usuario(message.author.id, texto_limpo, resposta)
             salvar_memoria()
             
-            # 5. Responde ao usuário
             await message.reply(resposta)
 
-# Iniciar
 client = EvaBot()
 client.run(DISCORD_TOKEN)
