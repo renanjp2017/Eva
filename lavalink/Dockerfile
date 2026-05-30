@@ -1,4 +1,4 @@
-FROM fredboat/lavalink:v4.0.5
+FROM ghcr.io/lavalink-devs/lavalink:4.0.5
 
 # Copia o seu arquivo de configuração para dentro do servidor
 COPY application.yml /opt/Lavalink/application.yml
