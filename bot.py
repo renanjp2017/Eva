@@ -232,18 +232,41 @@ async def scheduler_humor():
         print(f"[HUMOR] Preset do dia sorteado: {humor_state.get('preset_nome')}")
 
 # ─────────────────────────────────────────
-#  ROTEADOR DE INTENÇÃO (GROQ — rápido)
+#  ROTEADOR DE INTENÇÃO — regex primeiro, Groq só se necessário
 # ─────────────────────────────────────────
-async def classificar_intencao(texto):
-    prompt = f"""Analise e retorne APENAS JSON válido, sem markdown.
-Mensagem: "{texto}"
+_PLAY_RE  = re.compile(r'^(play|toca|toque|bota|coloca|quero ouvir|me bota|roda)\s+(.+)', re.I)
+_SKIP_RE  = re.compile(r'\b(skip|pula|próxima|proxima|pular|skipa)\b', re.I)
+_STOP_RE  = re.compile(r'\b(stop|para|sai|desliga|cala|cancela)\b', re.I)
+_SEARCH_RE= re.compile(r'\b(o que é|quem é|o que foi|quando foi|onde fica|como funciona|me fala sobre|pesquisa|busca|notícia|noticia)\b', re.I)
 
-Regras:
+def _regex_intencao(texto):
+    tl = texto.strip()
+    m = _PLAY_RE.match(tl)
+    if m:
+        return {"intent":"music","action":"play","query":m.group(2).strip()}
+    if _SKIP_RE.search(tl):
+        return {"intent":"music","action":"skip","query":""}
+    if _STOP_RE.search(tl):
+        return {"intent":"music","action":"stop","query":""}
+    if _SEARCH_RE.search(tl):
+        return {"intent":"search","action":"none","query":tl}
+    return None
+
+async def classificar_intencao(texto):
+    # tenta regex antes — mais rápido e confiável pra pt-BR
+    rapido = _regex_intencao(texto)
+    if rapido:
+        print(f"[ROUTER regex] {rapido}")
+        return rapido
+
+    prompt = f"""Retorne APENAS JSON válido, sem markdown.
+Mensagem em português: "{texto}"
+
 - "intent": "music" se quer tocar/parar/pular música
-- "intent": "search" se é pergunta factual ou notícia
-- "intent": "chat" para conversa normal
-- "action": "play"/"skip"/"stop" apenas se intent=music, senão "none"
-- "query": termo limpo da mensagem
+- "intent": "search" se é pergunta factual
+- "intent": "chat" para conversa
+- "action": "play"/"skip"/"stop" só se music, senão "none"
+- "query": termo limpo
 
 Exemplos:
 {{"intent":"music","action":"play","query":"linkin park"}}
@@ -258,7 +281,9 @@ Exemplos:
                 max_tokens=80,
             )
         )
-        return json.loads(r.choices[0].message.content)
+        result = json.loads(r.choices[0].message.content)
+        print(f"[ROUTER groq] {result}")
+        return result
     except Exception as e:
         print(f"[GROQ ROUTER ERR]: {e}")
         return {"intent":"chat","action":"none","query":texto}
