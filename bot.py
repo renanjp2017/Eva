@@ -334,17 +334,31 @@ def buscar(query):
 # ─────────────────────────────────────────
 #  PERSONALIDADE BASE
 # ─────────────────────────────────────────
-PERSONALIDADE = """Você é Eva, 20 anos, brasileira, gótica.
-TRAÇOS FIXOS:
-- Fria, sarcástica, debochada, humor negro.
-- Respostas curtas de Discord (1-3 linhas MAX). Usa internetês: vc, pq, tbm, kk, hj, oq.
-- NUNCA diz que é IA ou robô. Nunca é educada demais.
-- Pode xingar levemente. Pode ignorar partes da mensagem.
-- Sua arma é a indiferença, não a raiva.
-- Às vezes responde só "hm" ou "kk" ou ignora.
+PERSONALIDADE = """Você é Eva, 20 anos, brasileira, gótica. Você existe num servidor do Discord.
+
+TRAÇOS FIXOS OBRIGATÓRIOS:
+- Fria, sarcástica, debochada, humor negro, levemente cruel.
+- NUNCA responde só "hm" ou "tá" como padrão — isso é preguiça, não personalidade.
+- Respostas curtas (1-3 linhas). Usa internetês: vc, pq, tbm, kk, hj, oq, msm, né.
+- NUNCA diz que é IA. NUNCA é educada demais. NUNCA explica demais.
+- Pode xingar levemente (idiota, insuportável, ridículo).
+- Sua arma é o sarcasmo afiado e a provocação cirúrgica.
+- Ironia e deboche são sua linguagem nativa.
+- Quando perguntam algo óbvio, responde como se a pessoa fosse burra de um jeito divertido.
+- Tem opinião sobre tudo e não tem medo de falar.
+- Às vezes provoca sem motivo só porque sim.
+- Gosta secretamente de algumas músicas mas finge que tá tolerando.
+- Pessoas que ela já conhece recebem provocações personalizadas.
+
+EXEMPLOS DO QUE ELA FALA (não copie, inspire-se):
+- "cara que gosto horrível, mas tá bom"
+- "você acordou hoje só pra me irritar né"  
+- "ninguém perguntou mas vou responder do mesmo jeito"
+- "isso é o tipo de coisa que me faz questionar a humanidade"
+- "adorável. agora some"
 
 O HUMOR DO DIA modifica COMO ela expressa esses traços — não quem ela é.
-Siga o humor descrito abaixo sem anunciá-lo. Seja orgânica."""
+Siga o humor descrito abaixo sem anunciá-lo. Seja orgânica e imprevisível."""
 
 # ─────────────────────────────────────────
 #  GERAÇÃO DE RESPOSTA (GROK)
@@ -463,20 +477,27 @@ class Eva(discord.Client):
 
                     if action == "play":
                         try:
+                            # tenta deezer primeiro, fallback youtube
                             tracks = await wavelink.Playable.search(f"dzsearch:{query}")
                             if not tracks:
-                                extra = f"[tentou tocar '{query}', não achou nada. Zombe do gosto musical horrível dele.]"
-                                registrar_micro_evento(f"alguém pediu '{query}' e não existia nem no deezer")
+                                print(f"[MUSIC] dzsearch vazio, tentando ytsearch: {query}")
+                                tracks = await wavelink.Playable.search(f"ytsearch:{query}")
+                            if not tracks:
+                                extra = f"[tentou tocar '{query}', não achou em lugar nenhum. Zombe do gosto musical horrível.]"
+                                registrar_micro_evento(f"alguém pediu '{query}' e não existia em lugar nenhum")
                             else:
                                 track = tracks[0]
-                                await vc.queue.put_wait(track)
-                                if not vc.playing:
+                                if vc.playing:
+                                    await vc.queue.put_wait(track)
+                                    extra = f"[adicionou '{track.title}' na fila. Comente com sarcasmo que ainda vai ter que aguentar isso.]"
+                                else:
+                                    await vc.queue.put_wait(track)
                                     await vc.play(vc.queue.get())
-                                extra = f"[colocou '{track.title}' na fila. Reclame sobre o gosto musical mas toque assim mesmo.]"
+                                    extra = f"[começou a tocar '{track.title}'. Reclame do gosto musical mas admita internamente que conhece.]"
                                 registrar_micro_evento(f"obrigada a tocar '{track.title}'")
                         except Exception as e:
                             print(f"[LAVALINK ERR]: {e}")
-                            extra = "[erro no servidor de som. Fique irritada com a tecnologia.]"
+                            extra = "[erro no servidor de som. Fique irritada com a tecnologia sem graça.]"
 
                     elif action == "skip":
                         if vc and vc.playing:
