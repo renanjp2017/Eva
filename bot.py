@@ -112,10 +112,7 @@ def contexto_usuario(user_id):
 
 # ─────────────────────────────────────────
 #  SISTEMA DE HUMOR ORGÂNICO
-#  Preset diário às 05:00 BRT + drift ao longo do dia
 # ─────────────────────────────────────────
-
-# Presets base: (nome, descrição interna, peso de sorteio)
 PRESETS_BASE = [
     ("letárgica",       "acordou sem motivo pra existir, tudo parece inútil, fala o mínimo",                    15),
     ("entediada",       "nada é interessante, responde com indiferença olimpiana",                               20),
@@ -140,7 +137,6 @@ EVENTOS_RAROS = [
     "está com fome e é surpreendentemente mais agressiva por isso",
 ]
 
-# Drift por horário — modifica levemente o humor base
 DRIFT_HORARIO = {
     range(5, 8):   "ainda acordando, mais lenta e menos afiada que o normal",
     range(8, 12):  "período mais estável do dia, humor base em peso normal",
@@ -159,7 +155,6 @@ def _drift_atual():
     return ""
 
 def sortear_preset():
-    """Sorteia preset com peso, substituindo evento_especial quando cair nele."""
     nomes   = [p[0] for p in PRESETS_BASE]
     descs   = [p[1] for p in PRESETS_BASE]
     pesos   = [p[2] for p in PRESETS_BASE]
@@ -173,15 +168,13 @@ def sortear_preset():
     return nome, desc
 
 def inicializar_humor_diario():
-    """Chamado às 05:00 BRT. Sorteia o preset do dia considerando o anterior."""
     hoje = datetime.now(TZ).strftime("%Y-%m-%d")
     if humor_state.get("data") == hoje:
-        return  # já inicializado hoje
+        return
 
     preset_anterior = humor_state.get("preset_nome", None)
     nome, desc = sortear_preset()
 
-    # Suavização: se caiu no mesmo preset do dia anterior, re-sorteia uma vez
     if nome == preset_anterior and nome not in ("evento_especial", "caótica"):
         nome2, desc2 = sortear_preset()
         if nome2 != preset_anterior:
@@ -191,11 +184,10 @@ def inicializar_humor_diario():
     humor_state["preset_nome"]  = nome
     humor_state["preset_desc"]  = desc
     humor_state["preset_anterior"] = preset_anterior
-    humor_state["micro_eventos"] = []   # eventos menores que acontecem no dia
+    humor_state["micro_eventos"] = []
     salvar_tudo()
 
 def registrar_micro_evento(descricao):
-    """Adiciona um micro-evento ao dia (ex: alguém foi rude, tocou música horrível)."""
     humor_state.setdefault("micro_eventos", [])
     humor_state["micro_eventos"].append(descricao)
     if len(humor_state["micro_eventos"]) > 5:
@@ -203,8 +195,7 @@ def registrar_micro_evento(descricao):
     salvar_tudo()
 
 def descrever_humor_atual():
-    """Monta a descrição completa do humor pra ir no system prompt."""
-    inicializar_humor_diario()  # garante que tá inicializado
+    inicializar_humor_diario()
     hora = datetime.now(TZ).hour
     drift = _drift_atual()
     preset = humor_state.get("preset_desc", "entediada")
@@ -217,12 +208,11 @@ def descrever_humor_atual():
     return "\n".join(partes)
 
 # ─────────────────────────────────────────
-#  SCHEDULER — roda às 05:00 BRT todo dia
+#  SCHEDULER
 # ─────────────────────────────────────────
 async def scheduler_humor():
     while True:
         agora = datetime.now(TZ)
-        # Próximo 05:00
         proximo = agora.replace(hour=5, minute=0, second=0, microsecond=0)
         if agora >= proximo:
             proximo += timedelta(days=1)
@@ -232,7 +222,7 @@ async def scheduler_humor():
         print(f"[HUMOR] Preset do dia sorteado: {humor_state.get('preset_nome')}")
 
 # ─────────────────────────────────────────
-#  ROTEADOR DE INTENÇÃO — regex primeiro, Groq só se necessário
+#  ROTEADOR DE INTENÇÃO
 # ─────────────────────────────────────────
 import unicodedata
 
@@ -250,7 +240,6 @@ def _extrair_query_musica(tl_norm, texto):
         idx = tl_norm.find(w_norm)
         if idx != -1:
             resto = texto[idx + len(w):].strip()
-            # remove palavras de ligação
             resto = re.sub(r'^(a |o |as |os |uma |um |música |musica |a música |a musica )', '', resto, flags=re.I).strip()
             if resto:
                 return resto
@@ -260,16 +249,13 @@ def _regex_intencao(texto):
     tl = texto.strip()
     tl_norm = _norm(tl)
 
-    # stop/skip primeiro (mais específico)
     if any(w in tl_norm for w in [_norm(w) for w in _STOP_WORDS]):
-        # evita falso positivo: "para tocar X" deve ser play
         if not any(w in tl_norm for w in [_norm(w) for w in _PLAY_WORDS]):
             return {"intent":"music","action":"stop","query":""}
 
     if any(w in tl_norm for w in [_norm(w) for w in _SKIP_WORDS]):
         return {"intent":"music","action":"skip","query":""}
 
-    # play
     query = _extrair_query_musica(tl_norm, tl)
     if query:
         return {"intent":"music","action":"play","query":query}
@@ -279,7 +265,6 @@ def _regex_intencao(texto):
     return None
 
 async def classificar_intencao(texto):
-    # tenta regex antes — mais rápido e confiável pra pt-BR
     rapido = _regex_intencao(texto)
     if rapido:
         print(f"[ROUTER regex] {rapido}")
@@ -361,7 +346,7 @@ O HUMOR DO DIA modifica COMO ela expressa esses traços — não quem ela é.
 Siga o humor descrito abaixo sem anunciá-lo. Seja orgânica e imprevisível."""
 
 # ─────────────────────────────────────────
-#  GERAÇÃO DE RESPOSTA (GROK)
+#  GERAÇÃO DE RESPOSTA (GROK + FALLBACK GROQ)
 # ─────────────────────────────────────────
 async def gerar_resposta(user_id, query, contexto_extra=""):
     humor = descrever_humor_atual()
@@ -378,6 +363,7 @@ async def gerar_resposta(user_id, query, contexto_extra=""):
         elif linha.startswith("E:"): msgs.append({"role":"assistant","content":linha[2:]})
     msgs.append({"role":"user","content":query})
 
+    # Tenta usar o Grok da xAI primeiro
     try:
         r = await asyncio.to_thread(
             lambda: grok_client.chat.completions.create(
@@ -389,8 +375,21 @@ async def gerar_resposta(user_id, query, contexto_extra=""):
         )
         return r.choices[0].message.content.strip()
     except Exception as e:
-        print(f"[GROK ERR]: {e}")
-        return random.choice(["hm", "q", "aff", "tá", "..."])
+        print(f"[GROK ERR] Alternando para o Groq Fallback devido ao erro: {e}")
+        # FALLBACK: Se o Grok falhar, usa o Groq para manter o bot funcional e inteligente
+        try:
+            r = await asyncio.to_thread(
+                lambda: groq_client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=msgs,
+                    max_tokens=120,
+                    temperature=0.92,
+                )
+            )
+            return r.choices[0].message.content.strip()
+        except Exception as groq_err:
+            print(f"[GROQ CRITICAL ERR]: {groq_err}")
+            return random.choice(["hm", "q", "aff", "tá", "..."])
 
 # ─────────────────────────────────────────
 #  BOT
@@ -409,7 +408,7 @@ class Eva(discord.Client):
     async def _conectar_lavalink(self):
         uri = os.getenv("LAVALINK_URI", "http://localhost:2333")
         pwd = os.getenv("LAVALINK_PASSWORD", "youshallnotpass")
-        await asyncio.sleep(15)  # espera lavalink subir
+        await asyncio.sleep(15)
         for tentativa in range(1, 25):
             try:
                 nodes = [wavelink.Node(uri=uri, password=pwd)]
@@ -482,20 +481,35 @@ class Eva(discord.Client):
 
                     if vc and action == "play":
                         try:
-                            result_tracks = await wavelink.Playable.search(f"dzsearch:{query}")
+                            # CORREÇÃO: Usando o node diretamente para efetuar buscas limpas no Deezer/Soundcloud (evita conflitos do Wavelink 3)
+                            node = wavelink.Pool.get_node()
+                            result_tracks = await node.fetch_tracks(f"dzsearch:{query}")
+                            
                             if not result_tracks:
-                                result_tracks = await wavelink.Playable.search(f"scsearch:{query}")
-                            print(f"[MUSIC] busca '{query}' -> {len(result_tracks)} resultado(s)")
-                            if not result_tracks:
+                                result_tracks = await node.fetch_tracks(f"scsearch:{query}")
+                            
+                            print(f"[MUSIC] busca '{query}' -> {result_tracks}")
+                            
+                            # Normaliza a resposta do Lavalink (Trata list, Playlist ou objetos customizados)
+                            tracks = []
+                            if result_tracks:
+                                if isinstance(result_tracks, wavelink.Playlist):
+                                    tracks = result_tracks.tracks
+                                elif hasattr(result_tracks, 'tracks'):
+                                    tracks = result_tracks.tracks
+                                else:
+                                    tracks = list(result_tracks)
+
+                            if not tracks:
                                 extra = f"[tentou tocar '{query}', não achou em lugar nenhum. Zombe do gosto musical horrível.]"
                                 registrar_micro_evento(f"alguém pediu '{query}' e não existia em lugar nenhum")
                             else:
-                                track = result_tracks[0]
+                                track = tracks[0]
                                 if vc.playing:
-                                    await vc.queue.put_wait(track)
+                                    vc.queue.put(track)  # CORREÇÃO: No Wavelink v3 o put é síncrono (não put_wait)
                                     extra = f"[adicionou '{track.title}' na fila. Comente com sarcasmo que ainda vai ter que aguentar isso.]"
                                 else:
-                                    await vc.queue.put_wait(track)
+                                    vc.queue.put(track)
                                     await vc.play(vc.queue.get())
                                     extra = f"[começou a tocar '{track.title}'. Reclame do gosto musical mas admita internamente que conhece.]"
                                 registrar_micro_evento(f"obrigada a tocar '{track.title}'")
