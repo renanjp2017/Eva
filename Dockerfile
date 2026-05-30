@@ -1,17 +1,17 @@
 FROM python:3.11-slim
 
-ENV PYTHONUNBUFFERED=1
+RUN apt-get update && apt-get install -y \
+    gcc \
+    libffi-dev \
+    libsodium-dev \
+    libopus-dev \
+    python3-dev \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg build-essential && \
-    rm -rf /var/lib/apt/lists/*
-
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r /app/requirements.txt
-
-COPY . /app
-
+COPY . .
 CMD ["python", "bot.py"]
