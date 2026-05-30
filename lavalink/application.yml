@@ -1,6 +1,6 @@
 lavalink:
   plugins:
-    - dependency: "com.github.topi314.lavasrc:lavasrc-plugin:4.2.0"
+    - dependency: "com.github.topi314.lavasrc:lavasrc-plugin:4.3.0"
       repository: "https://maven.lavalink.dev/releases"
       snapshot: false
   server:
@@ -19,9 +19,9 @@ lavalink:
         - "dzisrc:%ISRC%"
         - "dzsearch:%QUERY%"
       sources:
-        spotify: false 
-        applemusic: false 
-        deezer: true 
+        spotify: false
+        applemusic: false
+        deezer: true
         yandexmusic: false
         flowerytts: false
         youtube: false
