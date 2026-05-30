@@ -225,7 +225,7 @@ async def gerar_resposta(user_id, intent_data, contexto_extra=""):
     try:
         r = await asyncio.to_thread(
             lambda: grok_client.chat.completions.create(
-                model="grok-2",
+                model="grok-4.3",
                 messages=mensagens,
                 max_tokens=150,
                 temperature=0.9
