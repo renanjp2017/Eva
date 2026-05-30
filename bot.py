@@ -409,17 +409,17 @@ class Eva(discord.Client):
     async def _conectar_lavalink(self):
         uri = os.getenv("LAVALINK_URI", "http://localhost:2333")
         pwd = os.getenv("LAVALINK_PASSWORD", "youshallnotpass")
-        await asyncio.sleep(5)
-        for tentativa in range(1, 13):
+        await asyncio.sleep(15)  # espera lavalink subir
+        for tentativa in range(1, 25):
             try:
                 nodes = [wavelink.Node(uri=uri, password=pwd)]
                 await wavelink.Pool.connect(nodes=nodes, client=self, cache_capacity=100)
                 print(f"[LAVALINK] Conectado na tentativa {tentativa}")
                 return
             except Exception as e:
-                print(f"[LAVALINK] Tentativa {tentativa}/12 falhou: {e}")
-                await asyncio.sleep(10)
-        print("[LAVALINK] Desistiu após 12 tentativas.")
+                print(f"[LAVALINK] Tentativa {tentativa}/24 falhou: {e}")
+                await asyncio.sleep(15)
+        print("[LAVALINK] Desistiu após 24 tentativas.")
 
     async def on_ready(self):
         preset = humor_state.get("preset_nome", "?")
@@ -471,11 +471,19 @@ class Eva(discord.Client):
                     extra = "[usuário pediu música mas não está em canal de voz. Deboche da burrice dele.]"
                     registrar_micro_evento("alguém pediu música sem estar no canal de voz")
                 else:
-                    vc: wavelink.Player = message.guild.voice_client
-                    if not vc:
-                        vc = await voice.channel.connect(cls=wavelink.Player)
+                    try:
+                        node = wavelink.Pool.get_node()
+                    except Exception:
+                        node = None
+                    if not node:
+                        extra = "[lavalink não conectou ainda. Reclame da tecnologia sem graça.]"
+                        registrar_micro_evento("tentou tocar música mas lavalink offline")
+                    else:
+                        vc: wavelink.Player = message.guild.voice_client
+                        if not vc:
+                            vc = await voice.channel.connect(cls=wavelink.Player)
 
-                    if action == "play":
+                    if node and action == "play":
                         try:
                             tracks = None
                             for prefixo in [f"dzsearch:{query}", f"scsearch:{query}"]:
