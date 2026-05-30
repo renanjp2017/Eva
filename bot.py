@@ -234,21 +234,47 @@ async def scheduler_humor():
 # ─────────────────────────────────────────
 #  ROTEADOR DE INTENÇÃO — regex primeiro, Groq só se necessário
 # ─────────────────────────────────────────
-_PLAY_RE  = re.compile(r'^(play|toca|toque|bota|coloca|quero ouvir|me bota|roda)\s+(.+)', re.I)
-_SKIP_RE  = re.compile(r'\b(skip|pula|próxima|proxima|pular|skipa)\b', re.I)
-_STOP_RE  = re.compile(r'\b(stop|para|sai|desliga|cala|cancela)\b', re.I)
-_SEARCH_RE= re.compile(r'\b(o que é|quem é|o que foi|quando foi|onde fica|como funciona|me fala sobre|pesquisa|busca|notícia|noticia)\b', re.I)
+import unicodedata
+
+def _norm(s):
+    return unicodedata.normalize('NFD', s).encode('ascii', 'ignore').decode().lower()
+
+_PLAY_WORDS = ['play','music','toca','toque','bota','coloca','quero ouvir','me bota','roda','toqua','músic']
+_SKIP_WORDS = ['skip','pula','proxima','próxima','pular','skipa','pular','próximo']
+_STOP_WORDS = ['stop','para','sai','desliga','cala','cancela','parar']
+_SEARCH_RE  = re.compile(r'\b(o que e|quem e|o que foi|quando foi|onde fica|como funciona|me fala sobre|pesquisa|busca|noticia)\b', re.I)
+
+def _extrair_query_musica(tl_norm, texto):
+    for w in sorted(_PLAY_WORDS, key=len, reverse=True):
+        w_norm = _norm(w)
+        idx = tl_norm.find(w_norm)
+        if idx != -1:
+            resto = texto[idx + len(w):].strip()
+            # remove palavras de ligação
+            resto = re.sub(r'^(a |o |as |os |uma |um |música |musica |a música |a musica )', '', resto, flags=re.I).strip()
+            if resto:
+                return resto
+    return None
 
 def _regex_intencao(texto):
     tl = texto.strip()
-    m = _PLAY_RE.match(tl)
-    if m:
-        return {"intent":"music","action":"play","query":m.group(2).strip()}
-    if _SKIP_RE.search(tl):
+    tl_norm = _norm(tl)
+
+    # stop/skip primeiro (mais específico)
+    if any(w in tl_norm for w in [_norm(w) for w in _STOP_WORDS]):
+        # evita falso positivo: "para tocar X" deve ser play
+        if not any(w in tl_norm for w in [_norm(w) for w in _PLAY_WORDS]):
+            return {"intent":"music","action":"stop","query":""}
+
+    if any(w in tl_norm for w in [_norm(w) for w in _SKIP_WORDS]):
         return {"intent":"music","action":"skip","query":""}
-    if _STOP_RE.search(tl):
-        return {"intent":"music","action":"stop","query":""}
-    if _SEARCH_RE.search(tl):
+
+    # play
+    query = _extrair_query_musica(tl_norm, tl)
+    if query:
+        return {"intent":"music","action":"play","query":query}
+
+    if _SEARCH_RE.search(tl_norm):
         return {"intent":"search","action":"none","query":tl}
     return None
 
