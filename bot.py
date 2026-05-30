@@ -471,33 +471,21 @@ class Eva(discord.Client):
                     extra = "[usuário pediu música mas não está em canal de voz. Deboche da burrice dele.]"
                     registrar_micro_evento("alguém pediu música sem estar no canal de voz")
                 else:
-                    try:
-                        node = wavelink.Pool.get_node()
-                    except Exception:
-                        node = None
-                    if not node or node.status != wavelink.NodeStatus.CONNECTED:
-                        extra = "[lavalink offline ainda. Tecnologia uma merda.]"
-                        registrar_micro_evento("tentou tocar música mas lavalink offline")
-                        node = None
-                    else:
-                        vc: wavelink.Player = message.guild.voice_client
-                        if not vc:
-                            try:
-                                vc = await voice.channel.connect(cls=wavelink.Player)
-                            except Exception as ce:
-                                print(f"[VOICE CONNECT ERR]: {ce}")
-                                extra = "[não consegui entrar no canal. Irritante.]"
-                                vc = None
-
-                    if node and vc and action == "play":
+                    vc: wavelink.Player = message.guild.voice_client
+                    if not vc:
                         try:
-                            # wavelink 3.x sempre adiciona ytmsearch: em buscas sem prefixo reconhecido
-                            # passando dzsearch: diretamente via Pool.fetch_tracks
-                            tracks = await node.fetch_tracks(f"dzsearch:{query}")
-                            if not tracks or not tracks.tracks:
-                                tracks = await node.fetch_tracks(f"scsearch:{query}")
-                            result_tracks = tracks.tracks if tracks and hasattr(tracks, "tracks") else []
-                            print(f"[MUSIC] busca dzsearch:{query} -> {len(result_tracks)} resultado(s)")
+                            vc = await voice.channel.connect(cls=wavelink.Player)
+                        except Exception as ce:
+                            print(f"[VOICE CONNECT ERR]: {ce}")
+                            extra = "[não consegui entrar no canal. Irritante.]"
+                            vc = None
+
+                    if vc and action == "play":
+                        try:
+                            result_tracks = await wavelink.Playable.search(f"dzsearch:{query}")
+                            if not result_tracks:
+                                result_tracks = await wavelink.Playable.search(f"scsearch:{query}")
+                            print(f"[MUSIC] busca '{query}' -> {len(result_tracks)} resultado(s)")
                             if not result_tracks:
                                 extra = f"[tentou tocar '{query}', não achou em lugar nenhum. Zombe do gosto musical horrível.]"
                                 registrar_micro_evento(f"alguém pediu '{query}' e não existia em lugar nenhum")
