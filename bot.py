@@ -485,16 +485,8 @@ class Eva(discord.Client):
 
                     if node and action == "play":
                         try:
-                            tracks = None
-                            for prefixo in [f"dzsearch:{query}", f"scsearch:{query}"]:
-                                try:
-                                    resultado_busca = await wavelink.Playable.search(prefixo)
-                                    if resultado_busca:
-                                        tracks = resultado_busca
-                                        print(f"[MUSIC] achou com: {prefixo}")
-                                        break
-                                except Exception as se:
-                                    print(f"[MUSIC] falhou {prefixo}: {se}")
+                            tracks = await wavelink.Playable.search(query)
+                            print(f"[MUSIC] busca por: {query} -> {len(tracks)} resultado(s)")
                             if not tracks:
                                 extra = f"[tentou tocar '{query}', não achou em lugar nenhum. Zombe do gosto musical horrível.]"
                                 registrar_micro_evento(f"alguém pediu '{query}' e não existia em lugar nenhum")
