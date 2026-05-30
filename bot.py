@@ -475,15 +475,21 @@ class Eva(discord.Client):
                         node = wavelink.Pool.get_node()
                     except Exception:
                         node = None
-                    if not node:
-                        extra = "[lavalink não conectou ainda. Reclame da tecnologia sem graça.]"
+                    if not node or node.status != wavelink.NodeStatus.CONNECTED:
+                        extra = "[lavalink offline ainda. Tecnologia uma merda.]"
                         registrar_micro_evento("tentou tocar música mas lavalink offline")
+                        node = None
                     else:
                         vc: wavelink.Player = message.guild.voice_client
                         if not vc:
-                            vc = await voice.channel.connect(cls=wavelink.Player)
+                            try:
+                                vc = await voice.channel.connect(cls=wavelink.Player)
+                            except Exception as ce:
+                                print(f"[VOICE CONNECT ERR]: {ce}")
+                                extra = "[não consegui entrar no canal. Irritante.]"
+                                vc = None
 
-                    if node and action == "play":
+                    if node and vc and action == "play":
                         try:
                             # wavelink 3.x sempre adiciona ytmsearch: em buscas sem prefixo reconhecido
                             # passando dzsearch: diretamente via Pool.fetch_tracks
