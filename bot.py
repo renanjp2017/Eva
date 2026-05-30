@@ -18,7 +18,6 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GROK_API_KEY = os.getenv("GROK_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# Usando a biblioteca OpenAI para acessar ambas as APIs
 grok_client = OpenAI(api_key=GROK_API_KEY, base_url="https://api.x.ai/v1")
 groq_client = OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
 
@@ -153,7 +152,7 @@ async def classificar_intencao(texto):
     Mensagem: "{texto}"
     
     Regras:
-    - "intent": "music" se o usuário quer tocar, parar ou pular música (ex: play, music, m.play, skip).
+    - "intent": "music" se o usuário quer tocar, parar ou pular música (ex: play, music, m!play, m!skip).
     - "intent": "search" se o usuário faz uma pergunta factual ou busca notícia.
     - "intent": "chat" para conversa normal.
     - "action": "play", "skip", "stop" (apenas se intent for music), senão "none".
@@ -253,25 +252,23 @@ async def on_message(message):
     texto_lower = texto.lower()
     
     # ── GATILHOS DE ATIVAÇÃO NATURAL ──
-    # Ativa se for marcada, se falarem "eva", "eva.", "eva," ou usarem palavras de comando de música
     is_mentioned = client.user in message.mentions
     has_name = bool(re.search(r'\beva\b', texto_lower))
-    is_music = texto_lower.startswith(("play ", "music ", "m.", ".m", ".skip", ".stop", ".play"))
+    # Ajustado para pegar "m!", ".skip", etc.
+    is_music = texto_lower.startswith(("play ", "music ", "m!", ".skip", ".stop", ".play"))
     
     if not (is_mentioned or has_name or is_music):
         return
 
-    # Salva o nome da pessoa pra memória
     u = get_usuario(message.author.id)
     if not u["nome"]: u["nome"] = message.author.display_name
 
-    # Limpa a mensagem pra IA não ler o próprio ID
     texto_limpo = texto.replace(f"<@{client.user.id}>", "").strip()
 
     async with message.channel.typing():
         await asyncio.sleep(random.uniform(0.8, 1.5))
         
-        # 1. Roteador entende o que o usuário quer
+        # 1. Roteador
         intent_data = await classificar_intencao(texto_limpo)
         intent = intent_data.get("intent", "chat")
         action = intent_data.get("action", "none")
@@ -286,29 +283,34 @@ async def on_message(message):
             if busca: contexto_extra = f"Resultado do DuckDuckGo: {busca}"
             
         elif intent == "music":
-            # Converte a intenção em comando pro Jockie Music
+            # Aqui configuramos o comando com o prefixo exato do Jockie
             if action == "play":
-                comando_jockie = f"m.play {query}"
+                comando_jockie = f"m!play {query}"
                 contexto_extra = f"[O usuário pediu pra tocar '{query}'. Vc já deu o play, tire sarro do gosto dele.]"
             elif action == "skip":
-                comando_jockie = "m.skip"
+                comando_jockie = "m!skip"
                 contexto_extra = "[Você acabou de pular a música, diga algo sobre como estava insuportável.]"
             elif action == "stop":
-                comando_jockie = "m.stop"
+                comando_jockie = "m!stop"
                 contexto_extra = "[Você parou a música, diga que não aguentava mais.]"
 
         # 3. Geração da Mensagem da Persona
         resposta = await gerar_resposta(message.author.id, intent_data, contexto_extra)
         
-        # 4. Envia o comando do Jockie pro chat (Jockie vai ler isso)
+        # 4. TRUQUE MÁGICO: Envia o comando e apaga em 0.5 segundos
         if comando_jockie:
-            await message.channel.send(comando_jockie)
+            try:
+                msg_comando = await message.channel.send(comando_jockie)
+                await asyncio.sleep(0.5) # O tempo exato pro Jockie ler antes de sumir
+                await msg_comando.delete()
+            except Exception as e:
+                print(f"[ERRO AO APAGAR COMANDO]: {e}")
             
         # 5. Salva memórias
         atualizar_memoria_usuario(message.author.id, texto_limpo, resposta)
         salvar_memoria()
         
-        # 6. Responde ao usuário
+        # 6. Responde ao usuário com a mensagem real
         await message.reply(resposta)
 
 client.run(DISCORD_TOKEN)
