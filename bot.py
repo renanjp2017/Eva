@@ -14,12 +14,19 @@ from openai import OpenAI
 
 load_dotenv()
 
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-GROQ_API_KEY  = os.getenv("GROQ_API_KEY")
-DATABASE_URL  = os.getenv("DATABASE_URL")
+DISCORD_TOKEN  = os.getenv("DISCORD_TOKEN")
+GROQ_API_KEY   = os.getenv("GROQ_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+DATABASE_URL   = os.getenv("DATABASE_URL")
 
-# Groq pra tudo — gratuito e funcional
+# Groq para roteador de intenção (rápido e gratuito)
 groq_client = OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
+
+# Gemini para respostas da Eva (melhor personalidade)
+gemini_client = OpenAI(
+    api_key=GEMINI_API_KEY,
+    base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+)
 
 TZ = ZoneInfo("America/Sao_Paulo")
 
@@ -59,7 +66,6 @@ async def init_db():
 #  MEMÓRIA POR USUÁRIO
 # ─────────────────────────────────────────
 def _lista(val):
-    """Garante que o valor retornado do banco seja sempre uma lista."""
     if isinstance(val, list):
         return val
     if isinstance(val, str):
@@ -89,7 +95,6 @@ async def atualizar_usuario(user_id: str, texto: str, resposta: str, display_nam
 
     nome = u["nome"] or display_name
 
-    # Detecta fatos pessoais
     tl = texto.lower()
     gatilhos = [
         "meu nome é", "eu tenho", "eu moro", "eu trabalho", "sou de",
@@ -105,7 +110,6 @@ async def atualizar_usuario(user_id: str, texto: str, resposta: str, display_nam
                 fatos = fatos[-20:]
             break
 
-    # Detecta temas
     temas = {
         "música":         ["música", "banda", "show", "playlist", "álbum", "toca", "play"],
         "relacionamento": ["namorado", "namorada", "ex", "término", "ficante", "crush", "separei"],
@@ -373,7 +377,7 @@ O HUMOR DO DIA modifica COMO ela expressa esses traços — não quem ela é.
 Siga o humor descrito abaixo sem anunciá-lo. Seja orgânica."""
 
 # ─────────────────────────────────────────
-#  GERAÇÃO DE RESPOSTA (GROQ — llama)
+#  GERAÇÃO DE RESPOSTA (GEMINI)
 # ─────────────────────────────────────────
 async def gerar_resposta(user_id: str, query: str, contexto_extra: str = "") -> str:
     humor = await descrever_humor_atual()
@@ -396,16 +400,16 @@ async def gerar_resposta(user_id: str, query: str, contexto_extra: str = "") -> 
 
     try:
         r = await asyncio.to_thread(
-            lambda: groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+            lambda: gemini_client.chat.completions.create(
+                model="gemini-2.0-flash",
                 messages=msgs,
                 max_tokens=120,
-                temperature=0.92,
+                temperature=0.95,
             )
         )
         return r.choices[0].message.content.strip()
     except Exception as e:
-        print(f"[GROQ RESP ERR]: {e}")
+        print(f"[GEMINI ERR]: {e}")
         return random.choice(["hm", "q", "aff", "tá", "..."])
 
 # ─────────────────────────────────────────
@@ -461,7 +465,6 @@ class Eva(discord.Client):
             query  = intent_data.get("query", texto_limpo)
             extra  = ""
 
-            # ── BUSCA ──────────────────────────────────────
             if intent == "search":
                 resultado = buscar(query)
                 if resultado:
@@ -469,7 +472,6 @@ class Eva(discord.Client):
                 else:
                     extra = "[busca não retornou nada. Diga que não sabe ou deboche da pergunta.]"
 
-            # ── MÚSICA ─────────────────────────────────────
             elif intent == "music":
                 voice = message.author.voice
                 if not voice:
