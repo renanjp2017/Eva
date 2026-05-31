@@ -1,5 +1,4 @@
 import discord
-import requests
 import random
 import asyncio
 import os
@@ -12,6 +11,8 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from openai import OpenAI
 from duckduckgo_search import DDGS
+from google import genai
+from google.genai import types
 
 load_dotenv()
 
@@ -20,14 +21,10 @@ GROQ_API_KEY   = os.getenv("GROQ_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DATABASE_URL   = os.getenv("DATABASE_URL")
 
-groq_client = OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
-gemini_client = OpenAI(
-    api_key=GEMINI_API_KEY,
-    base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
-)
+groq_client   = OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 TZ = ZoneInfo("America/Sao_Paulo")
-
 db_pool: asyncpg.Pool = None
 
 async def init_db():
@@ -351,6 +348,22 @@ PESSOAS QUE VOCÊ CONHECE NO SERVIDOR:
 O HUMOR DO DIA modifica COMO ela expressa esses traços — não quem ela é.
 Siga o humor descrito abaixo sem anunciá-lo. Seja orgânica."""
 
+def _montar_historico_gemini(historico: list) -> list:
+    """Converte histórico pro formato de contents do google-genai."""
+    contents = []
+    for linha in historico[-12:]:
+        if linha.startswith("U:"):
+            contents.append(types.Content(
+                role="user",
+                parts=[types.Part(text=linha[2:])]
+            ))
+        elif linha.startswith("E:"):
+            contents.append(types.Content(
+                role="model",
+                parts=[types.Part(text=linha[2:])]
+            ))
+    return contents
+
 async def gerar_resposta(user_id: str, query: str, contexto_extra: str = "") -> str:
     humor = await descrever_humor_atual()
     ctx   = await contexto_usuario(user_id)
@@ -362,30 +375,39 @@ async def gerar_resposta(user_id: str, query: str, contexto_extra: str = "") -> 
     u = await get_usuario(user_id)
     historico = _lista(u["historico"])
 
-    msgs = [{"role": "system", "content": system}]
-    for linha in historico[-12:]:
-        if linha.startswith("U:"):
-            msgs.append({"role": "user",      "content": linha[2:]})
-        elif linha.startswith("E:"):
-            msgs.append({"role": "assistant", "content": linha[2:]})
-    msgs.append({"role": "user", "content": query})
-
-    # 1. Gemini 2.0 Flash
+    # 1. Gemini 1.5 Flash via google-genai
     try:
+        contents = _montar_historico_gemini(historico)
+        contents.append(types.Content(
+            role="user",
+            parts=[types.Part(text=query)]
+        ))
+
         r = await asyncio.to_thread(
-            lambda: gemini_client.chat.completions.create(
+            lambda: gemini_client.models.generate_content(
                 model="gemini-1.5-flash",
-                messages=msgs,
-                max_tokens=120,
-                temperature=0.95,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=system,
+                    max_output_tokens=120,
+                    temperature=0.95,
+                )
             )
         )
-        return r.choices[0].message.content.strip()
+        return r.text.strip()
     except Exception as e:
         print(f"[GEMINI ERR]: {e}")
 
     # 2. Fallback Groq
     try:
+        msgs = [{"role": "system", "content": system}]
+        for linha in historico[-12:]:
+            if linha.startswith("U:"):
+                msgs.append({"role": "user",      "content": linha[2:]})
+            elif linha.startswith("E:"):
+                msgs.append({"role": "assistant", "content": linha[2:]})
+        msgs.append({"role": "user", "content": query})
+
         r = await asyncio.to_thread(
             lambda: groq_client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
