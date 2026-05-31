@@ -166,7 +166,7 @@ PRESETS_BASE = [
     ("melancólica",     "pensativa, meio distante, responde mas parece que tá em outro lugar",                8),
     ("caótica",         "humor impossível de prever, muda de tom no meio da frase, imprevisível",             7),
     ("ressaquenta",     "de ressaca com energia nervosa, brava mas presente",                                  5),
-    ("rainha-do-drama", "tudo é uma tragedy pessoal, exagera cada coisa",                                    5),
+    ("rainha-do-drama", "tudo é uma tragédia pessoal, exagera cada coisa",                                    5),
     ("evento_especial", "PLACEHOLDER",                                                                         5),
 ]
 
@@ -422,8 +422,7 @@ class Eva(discord.Client):
     async def on_ready(self):
         print(f"[EVA] Online: {self.user}")
 
-    # Decorador nativo correto para o Wavelink v3 escutar o término de faixas automaticamente
-    @wavelink.EventHandler()
+    # Captura automática usando o despachante padrão do discord.py para eventos do Wavelink v3
     async def on_wavelink_track_end(self, payload: wavelink.TrackEndEventPayload):
         player = payload.player
         if player and not player.queue.is_empty:
@@ -510,6 +509,6 @@ class Eva(discord.Client):
             await atualizar_usuario(user_id, texto_limpo, resposta, display)
             await message.reply(resposta)
 
-# Execução limpa do bot
+# Inicialização direta e sem fricção
 bot = Eva()
 bot.run(DISCORD_TOKEN)
