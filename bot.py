@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from openai import OpenAI
+from duckduckgo_search import DDGS
 
 load_dotenv()
 
@@ -317,20 +318,14 @@ Exemplos:
 
 def buscar(query: str) -> str:
     try:
-        r = requests.get(
-            "https://api.duckduckgo.com/",
-            params={"q": query, "format": "json", "no_html": 1, "skip_disambig": 1},
-            timeout=6
-        ).json()
-        if r.get("AbstractText"):
-            return r["AbstractText"][:500]
-        tops = [
-            t["Text"][:180]
-            for t in r.get("RelatedTopics", [])[:3]
-            if isinstance(t, dict) and "Text" in t
-        ]
-        return " ".join(tops) if tops else ""
-    except Exception:
+        with DDGS() as ddgs:
+            resultados = list(ddgs.text(query, max_results=3))
+        if not resultados:
+            return ""
+        partes = [r.get("body", "")[:200] for r in resultados if r.get("body")]
+        return " ".join(partes)[:500]
+    except Exception as e:
+        print(f"[DDGS ERR]: {e}")
         return ""
 
 PERSONALIDADE = """Você é Eva, 20 anos, brasileira, gótica.
@@ -375,11 +370,11 @@ async def gerar_resposta(user_id: str, query: str, contexto_extra: str = "") -> 
             msgs.append({"role": "assistant", "content": linha[2:]})
     msgs.append({"role": "user", "content": query})
 
-    # Tenta Gemini 1.5 Flash primeiro
+    # 1. Gemini 2.0 Flash
     try:
         r = await asyncio.to_thread(
             lambda: gemini_client.chat.completions.create(
-                model="gemini-3-flash",
+                model="gemini-2.0-flash",
                 messages=msgs,
                 max_tokens=120,
                 temperature=0.95,
@@ -387,10 +382,9 @@ async def gerar_resposta(user_id: str, query: str, contexto_extra: str = "") -> 
         )
         return r.choices[0].message.content.strip()
     except Exception as e:
-        codigo = getattr(e, "status_code", None) or getattr(e, "code", None)
-        print(f"[GEMINI ERR {codigo}]: {e}")
+        print(f"[GEMINI ERR]: {e}")
 
-    # Fallback Groq
+    # 2. Fallback Groq
     try:
         r = await asyncio.to_thread(
             lambda: groq_client.chat.completions.create(
@@ -400,10 +394,12 @@ async def gerar_resposta(user_id: str, query: str, contexto_extra: str = "") -> 
                 temperature=0.92,
             )
         )
+        print("[FALLBACK] Groq")
         return r.choices[0].message.content.strip()
     except Exception as e:
-        print(f"[GROQ RESP ERR]: {e}")
-        return random.choice(["hm", "q", "aff", "tá", "..."])
+        print(f"[GROQ ERR]: {e}")
+
+    return random.choice(["hm", "q", "aff", "tá", "..."])
 
 class Eva(discord.Client):
     def __init__(self):
@@ -455,7 +451,7 @@ class Eva(discord.Client):
             extra  = ""
 
             if intent == "search":
-                resultado = buscar(query)
+                resultado = await asyncio.to_thread(buscar, query)
                 if resultado:
                     extra = f"Resultado de busca: {resultado}"
                 else:
@@ -478,7 +474,7 @@ class Eva(discord.Client):
                                 tracks = await wavelink.Playable.search(f"scsearch:{query}")
                             if not tracks:
                                 extra = f"[não achou '{query}'. Zombe do gosto musical.]"
-                                await registrar_micro_evento(f"pediu '{query}' e não existia em nenhuma fonte")
+                                await registrar_micro_evento(f"pediu '{query}' e não existia")
                             else:
                                 track = tracks[0]
                                 await vc.queue.put_wait(track)
