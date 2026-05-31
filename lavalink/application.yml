@@ -1,10 +1,10 @@
 lavalink:
   plugins:
-    # YouTube Source com suporte a PO Token
-    - dependency: "dev.lavalink.youtube:youtube-plugin:1.11.3"
+    # YouTube Source com suporte a PO Token (Atualizado para v1.18.1)
+    - dependency: "dev.lavalink.youtube:youtube-plugin:1.18.1"
       repository: "https://maven.lavalink.dev/releases"
-    # LavaSrc para SoundCloud como fallback
-    - dependency: "com.github.topi314.lavasrc:lavasrc-plugin:4.3.0"
+    # LavaSrc como fallback (Atualizado para v4.8.3)
+    - dependency: "com.github.topi314.lavasrc:lavasrc-plugin:4.8.3"
       repository: "https://maven.lavalink.dev/releases"
 
   server:
@@ -18,7 +18,7 @@ lavalink:
       http: true
       local: false
 
-# CORREÇÃO: Movido para a raiz do arquivo e renomeado para 'plugins'
+# Configurações globais dos plugins (Raiz do arquivo)
 plugins:
   youtube:
     enabled: true
@@ -29,8 +29,8 @@ plugins:
       - MUSIC
       - ANDROID_TESTSUITE
       - WEB
-      - TVHTML5EMBEDDED
-    # Certifique-se de que o container está recebendo essas variáveis de ambiente corretamente
+      - TVHTML5_SIMPLY   # CORREÇÃO: TVHTML5EMBEDDED foi removido, use este no lugar
+    # Certifique-se de preencher estas variáveis no seu ambiente ou Docker (.env)
     poToken: "${PO_TOKEN:}"
     visitorData: "${VISITOR_DATA:}"
 
