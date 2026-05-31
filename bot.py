@@ -7,7 +7,6 @@ import json
 import re
 import wavelink
 import asyncpg
-import openai
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
@@ -303,12 +302,13 @@ Exemplos:
 
     try:
         r = await asyncio.to_thread(
-            groq_client.chat.completions.create,
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0,
-            response_format={"type": "json_object"},
-            max_tokens=80,
+            lambda: groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                response_format={"type": "json_object"},
+                max_tokens=80,
+            )
         )
         return json.loads(r.choices[0].message.content)
     except Exception as e:
@@ -378,26 +378,27 @@ async def gerar_resposta(user_id: str, query: str, contexto_extra: str = "") -> 
     # Tenta Gemini 1.5 Flash primeiro
     try:
         r = await asyncio.to_thread(
-            gemini_client.chat.completions.create,
-            model="gemini-1.5-flash",
-            messages=msgs,
-            max_tokens=120,
-            temperature=0.95,
+            lambda: gemini_client.chat.completions.create(
+                model="gemini-3.5-flash",
+                messages=msgs,
+                max_tokens=120,
+                temperature=0.95,
+            )
         )
         return r.choices[0].message.content.strip()
-    except openai.APIStatusError as e:
-        print(f"[GEMINI ERR {e.status_code}]: {e.message}")
     except Exception as e:
-        print(f"[GEMINI UNKNOWN ERR]: {e}")
+        codigo = getattr(e, "status_code", None) or getattr(e, "code", None)
+        print(f"[GEMINI ERR {codigo}]: {e}")
 
     # Fallback Groq
     try:
         r = await asyncio.to_thread(
-            groq_client.chat.completions.create,
-            model="llama-3.3-70b-versatile",
-            messages=msgs,
-            max_tokens=120,
-            temperature=0.92,
+            lambda: groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=msgs,
+                max_tokens=120,
+                temperature=0.92,
+            )
         )
         return r.choices[0].message.content.strip()
     except Exception as e:
@@ -422,11 +423,9 @@ class Eva(discord.Client):
     async def on_ready(self):
         print(f"[EVA] Online: {self.user}")
 
-    # Captura automática usando o despachante padrão do discord.py para eventos do Wavelink v3
     async def on_wavelink_track_end(self, payload: wavelink.TrackEndEventPayload):
-        player = payload.player
-        if player and not player.queue.is_empty:
-            await player.play(player.queue.get())
+        if not payload.player.queue.is_empty:
+            await payload.player.play(payload.player.queue.get())
 
     async def on_message(self, message: discord.Message):
         if message.author.bot:
@@ -493,7 +492,7 @@ class Eva(discord.Client):
 
                     elif action == "skip":
                         if vc and vc.playing:
-                            await vc.skip()
+                            await vc.skip(force=True)
                             extra = "[pulou a música. Diga que era horrível mesmo.]"
                         else:
                             extra = "[pediu pra pular mas não tem nada tocando. Chame de distraído.]"
@@ -509,6 +508,5 @@ class Eva(discord.Client):
             await atualizar_usuario(user_id, texto_limpo, resposta, display)
             await message.reply(resposta)
 
-# Inicialização direta e sem fricção
-bot = Eva()
-bot.run(DISCORD_TOKEN)
+
+Eva().run(DISCORD_TOKEN)
