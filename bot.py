@@ -7,7 +7,7 @@ import json
 import re
 import wavelink
 import asyncpg
-import openai  # Importado explicitamente para tratar erros de API
+import openai
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
@@ -385,7 +385,7 @@ async def gerar_resposta(user_id: str, query: str, contexto_extra: str = "") -> 
             temperature=0.95,
         )
         return r.choices[0].message.content.strip()
-    except openai.APIStatusError as e:  # Tratamento correto para erros de API da OpenAI
+    except openai.APIStatusError as e:
         print(f"[GEMINI ERR {e.status_code}]: {e.message}")
     except Exception as e:
         print(f"[GEMINI UNKNOWN ERR]: {e}")
@@ -414,7 +414,6 @@ class Eva(discord.Client):
         await init_db()
         await inicializar_humor_diario()
         asyncio.create_task(scheduler_humor())
-        
         uri = os.getenv("LAVALINK_URI", "http://lavalink:2333")
         pwd = os.getenv("LAVALINK_PASSWORD", "youshallnotpass")
         nodes = [wavelink.Node(uri=uri, password=pwd)]
@@ -423,8 +422,6 @@ class Eva(discord.Client):
     async def on_ready(self):
         print(f"[EVA] Online: {self.user}")
 
-    # Registro correto de eventos Wavelink v3 usando escuta por Dispatcher interno
-    @wavelink.EventHandler Pallback
     async def on_wavelink_track_end(self, payload: wavelink.TrackEndEventPayload):
         player = payload.player
         if player and not player.queue.is_empty:
@@ -476,7 +473,6 @@ class Eva(discord.Client):
 
                     if action == "play":
                         try:
-                            # Mudança sutil: Wavelink v3 prefere buscas usando objetos nativos e o roteador do Player
                             tracks = await wavelink.Playable.search(f"ytsearch:{query}")
                             if not tracks:
                                 tracks = await wavelink.Playable.search(f"scsearch:{query}")
@@ -512,7 +508,7 @@ class Eva(discord.Client):
             await atualizar_usuario(user_id, texto_limpo, resposta, display)
             await message.reply(resposta)
 
-# Registro dinâmico de eventos na instância do Wavelink
+# Instanciação do bot e vinculação do Listener de áudio nativo do Wavelink v3
 bot = Eva()
 wavelink.Pool.shared_dispatcher.add_listener(bot.on_wavelink_track_end)
 
