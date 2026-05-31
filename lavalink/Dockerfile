@@ -2,8 +2,8 @@ FROM eclipse-temurin:17-jre-alpine
 
 WORKDIR /lavalink
 
-# Baixa o Lavalink jar
-ADD https://github.com/lavalink-devtools/youtube-source/releases/download/v1.11.3/Lavalink.jar Lavalink.jar
+# CORREÇÃO: Baixa o Lavalink v4 oficial do repositório correto
+ADD https://github.com/lavalink-devs/Lavalink/releases/download/4.0.8/Lavalink.jar Lavalink.jar
 
 COPY application.yml application.yml
 
