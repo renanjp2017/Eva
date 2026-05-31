@@ -1,6 +1,6 @@
 lavalink:
   plugins:
-    # YouTube Source com suporte a PO Token (substitui o source nativo)
+    # YouTube Source com suporte a PO Token
     - dependency: "dev.lavalink.youtube:youtube-plugin:1.11.3"
       repository: "https://maven.lavalink.dev/releases"
     # LavaSrc para SoundCloud como fallback
@@ -18,32 +18,33 @@ lavalink:
       http: true
       local: false
 
-  pluginsConfig:
-    youtube:
-      enabled: true
-      allowSearch: true
-      allowDirectVideoIds: true
-      allowDirectPlaylistIds: true
-      clients:
-        - MUSIC
-        - ANDROID_TESTSUITE
-        - WEB
-        - TVHTML5EMBEDDED
-      # Cole aqui os valores gerados pelo youtube-po-token-generator
-      poToken: "${PO_TOKEN:}"
-      visitorData: "${VISITOR_DATA:}"
+# CORREÇÃO: Movido para a raiz do arquivo e renomeado para 'plugins'
+plugins:
+  youtube:
+    enabled: true
+    allowSearch: true
+    allowDirectVideoIds: true
+    allowDirectPlaylistIds: true
+    clients:
+      - MUSIC
+      - ANDROID_TESTSUITE
+      - WEB
+      - TVHTML5EMBEDDED
+    # Certifique-se de que o container está recebendo essas variáveis de ambiente corretamente
+    poToken: "${PO_TOKEN:}"
+    visitorData: "${VISITOR_DATA:}"
 
-    lavasrc:
-      providers:
-        - "ytsearch:%QUERY%"
-        - "scsearch:%QUERY%"
-      sources:
-        spotify: false
-        applemusic: false
-        deezer: false
-        yandexmusic: false
-        youtube: true
-        soundcloud: true
+  lavasrc:
+    providers:
+      - "ytsearch:%QUERY%"
+      - "scsearch:%QUERY%"
+    sources:
+      spotify: false
+      applemusic: false
+      deezer: false
+      yandexmusic: false
+      youtube: true
+      soundcloud: true
 
 server:
   port: 2333
