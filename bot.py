@@ -374,7 +374,7 @@ async def gerar_resposta(user_id: str, query: str, contexto_extra: str = "") -> 
     try:
         r = await asyncio.to_thread(
             lambda: gemini_client.chat.completions.create(
-                model="gemini-2.0-flash",
+                model="gemini-1.5-flash",
                 messages=msgs,
                 max_tokens=120,
                 temperature=0.95,
