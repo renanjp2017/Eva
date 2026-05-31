@@ -7,6 +7,7 @@ import json
 import re
 import wavelink
 import asyncpg
+import openai  # Importado explicitamente para tratar erros de API
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
@@ -302,13 +303,12 @@ Exemplos:
 
     try:
         r = await asyncio.to_thread(
-            lambda: groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0,
-                response_format={"type": "json_object"},
-                max_tokens=80,
-            )
+            groq_client.chat.completions.create,
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            response_format={"type": "json_object"},
+            max_tokens=80,
         )
         return json.loads(r.choices[0].message.content)
     except Exception as e:
@@ -378,27 +378,26 @@ async def gerar_resposta(user_id: str, query: str, contexto_extra: str = "") -> 
     # Tenta Gemini 1.5 Flash primeiro
     try:
         r = await asyncio.to_thread(
-            lambda: gemini_client.chat.completions.create(
-                model="gemini-1.5-flash",
-                messages=msgs,
-                max_tokens=120,
-                temperature=0.95,
-            )
+            gemini_client.chat.completions.create,
+            model="gemini-1.5-flash",
+            messages=msgs,
+            max_tokens=120,
+            temperature=0.95,
         )
         return r.choices[0].message.content.strip()
+    except openai.APIStatusError as e:  # Tratamento correto para erros de API da OpenAI
+        print(f"[GEMINI ERR {e.status_code}]: {e.message}")
     except Exception as e:
-        codigo = getattr(e, "status_code", None) or getattr(e, "code", None)
-        print(f"[GEMINI ERR {codigo}]: {e}")
+        print(f"[GEMINI UNKNOWN ERR]: {e}")
 
     # Fallback Groq
     try:
         r = await asyncio.to_thread(
-            lambda: groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=msgs,
-                max_tokens=120,
-                temperature=0.92,
-            )
+            groq_client.chat.completions.create,
+            model="llama-3.3-70b-versatile",
+            messages=msgs,
+            max_tokens=120,
+            temperature=0.92,
         )
         return r.choices[0].message.content.strip()
     except Exception as e:
@@ -415,6 +414,7 @@ class Eva(discord.Client):
         await init_db()
         await inicializar_humor_diario()
         asyncio.create_task(scheduler_humor())
+        
         uri = os.getenv("LAVALINK_URI", "http://lavalink:2333")
         pwd = os.getenv("LAVALINK_PASSWORD", "youshallnotpass")
         nodes = [wavelink.Node(uri=uri, password=pwd)]
@@ -423,9 +423,12 @@ class Eva(discord.Client):
     async def on_ready(self):
         print(f"[EVA] Online: {self.user}")
 
+    # Registro correto de eventos Wavelink v3 usando escuta por Dispatcher interno
+    @wavelink.EventHandler Pallback
     async def on_wavelink_track_end(self, payload: wavelink.TrackEndEventPayload):
-        if not payload.player.queue.is_empty:
-            await payload.player.play(payload.player.queue.get())
+        player = payload.player
+        if player and not player.queue.is_empty:
+            await player.play(player.queue.get())
 
     async def on_message(self, message: discord.Message):
         if message.author.bot:
@@ -473,6 +476,7 @@ class Eva(discord.Client):
 
                     if action == "play":
                         try:
+                            # Mudança sutil: Wavelink v3 prefere buscas usando objetos nativos e o roteador do Player
                             tracks = await wavelink.Playable.search(f"ytsearch:{query}")
                             if not tracks:
                                 tracks = await wavelink.Playable.search(f"scsearch:{query}")
@@ -492,7 +496,7 @@ class Eva(discord.Client):
 
                     elif action == "skip":
                         if vc and vc.playing:
-                            await vc.skip(force=True)
+                            await vc.skip()
                             extra = "[pulou a música. Diga que era horrível mesmo.]"
                         else:
                             extra = "[pediu pra pular mas não tem nada tocando. Chame de distraído.]"
@@ -508,5 +512,8 @@ class Eva(discord.Client):
             await atualizar_usuario(user_id, texto_limpo, resposta, display)
             await message.reply(resposta)
 
+# Registro dinâmico de eventos na instância do Wavelink
+bot = Eva()
+wavelink.Pool.shared_dispatcher.add_listener(bot.on_wavelink_track_end)
 
-Eva().run(DISCORD_TOKEN)
+bot.run(DISCORD_TOKEN)
