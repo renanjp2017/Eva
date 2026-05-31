@@ -19,10 +19,7 @@ GROQ_API_KEY   = os.getenv("GROQ_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DATABASE_URL   = os.getenv("DATABASE_URL")
 
-# Groq para roteador de intenção (rápido e gratuito)
 groq_client = OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
-
-# Gemini para respostas da Eva (melhor personalidade)
 gemini_client = OpenAI(
     api_key=GEMINI_API_KEY,
     base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
@@ -30,9 +27,6 @@ gemini_client = OpenAI(
 
 TZ = ZoneInfo("America/Sao_Paulo")
 
-# ─────────────────────────────────────────
-#  BANCO DE DADOS
-# ─────────────────────────────────────────
 db_pool: asyncpg.Pool = None
 
 async def init_db():
@@ -62,9 +56,6 @@ async def init_db():
             )
         """)
 
-# ─────────────────────────────────────────
-#  MEMÓRIA POR USUÁRIO
-# ─────────────────────────────────────────
 def _lista(val):
     if isinstance(val, list):
         return val
@@ -92,7 +83,6 @@ async def atualizar_usuario(user_id: str, texto: str, resposta: str, display_nam
     fatos     = _lista(u["fatos"])
     assuntos  = _lista(u["assuntos"])
     historico = _lista(u["historico"])
-
     nome = u["nome"] or display_name
 
     tl = texto.lower()
@@ -165,9 +155,6 @@ async def contexto_usuario(user_id: str):
         partes.append("já se conhecem")
     return " | ".join(partes) if partes else "desconhecida"
 
-# ─────────────────────────────────────────
-#  SISTEMA DE HUMOR
-# ─────────────────────────────────────────
 PRESETS_BASE = [
     ("letárgica",       "acordou sem motivo pra existir, tudo parece inútil, fala o mínimo",                 15),
     ("entediada",       "nada é interessante, responde com indiferença olimpiana",                            20),
@@ -281,9 +268,6 @@ async def scheduler_humor():
         await asyncio.sleep((proximo - agora).total_seconds())
         await inicializar_humor_diario()
 
-# ─────────────────────────────────────────
-#  ROTEADOR DE INTENÇÃO (GROQ)
-# ─────────────────────────────────────────
 MUSIC_REGEX = re.compile(
     r"^(play|toca|m!play|\.play|tocar)\s+.+|"
     r"^(skip|pula|m!skip|\.skip|próxima|proxima)\b|"
@@ -331,9 +315,6 @@ Exemplos:
         print(f"[GROQ ROUTER ERR]: {e}")
         return {"intent": "chat", "action": "none", "query": texto}
 
-# ─────────────────────────────────────────
-#  BUSCA DUCKDUCKGO
-# ─────────────────────────────────────────
 def buscar(query: str) -> str:
     try:
         r = requests.get(
@@ -352,9 +333,6 @@ def buscar(query: str) -> str:
     except Exception:
         return ""
 
-# ─────────────────────────────────────────
-#  PERSONALIDADE BASE
-# ─────────────────────────────────────────
 PERSONALIDADE = """Você é Eva, 20 anos, brasileira, gótica.
 
 TRAÇOS FIXOS:
@@ -365,6 +343,8 @@ TRAÇOS FIXOS:
 - Sua arma é a indiferença, não a raiva.
 - Às vezes responde só "hm" ou "kk" ou ignora.
 - Usa memória do usuário pra zoar ou provocar com contexto real.
+- Se perguntarem algo que você sabe, responda com o estilo Eva — sarcástica mas informativa.
+- Se não souber, deboche da pergunta ou da pessoa, nunca diga só "tá" ou "...".
 
 PESSOAS QUE VOCÊ CONHECE NO SERVIDOR:
 - Mel: ex-funcionária do Atacadão, cursa nutrição. Pode usar de exemplo pra tudo — humilhar, zoar, dar em cima.
@@ -376,9 +356,6 @@ PESSOAS QUE VOCÊ CONHECE NO SERVIDOR:
 O HUMOR DO DIA modifica COMO ela expressa esses traços — não quem ela é.
 Siga o humor descrito abaixo sem anunciá-lo. Seja orgânica."""
 
-# ─────────────────────────────────────────
-#  GERAÇÃO DE RESPOSTA (GEMINI)
-# ─────────────────────────────────────────
 async def gerar_resposta(user_id: str, query: str, contexto_extra: str = "") -> str:
     humor = await descrever_humor_atual()
     ctx   = await contexto_usuario(user_id)
@@ -398,10 +375,11 @@ async def gerar_resposta(user_id: str, query: str, contexto_extra: str = "") -> 
             msgs.append({"role": "assistant", "content": linha[2:]})
     msgs.append({"role": "user", "content": query})
 
+    # Tenta Gemini 1.5 Flash primeiro
     try:
         r = await asyncio.to_thread(
             lambda: gemini_client.chat.completions.create(
-                model="gemini-2.0-flash",
+                model="gemini-1.5-flash",
                 messages=msgs,
                 max_tokens=120,
                 temperature=0.95,
@@ -409,12 +387,24 @@ async def gerar_resposta(user_id: str, query: str, contexto_extra: str = "") -> 
         )
         return r.choices[0].message.content.strip()
     except Exception as e:
-        print(f"[GEMINI ERR]: {e}")
+        codigo = getattr(e, "status_code", None) or getattr(e, "code", None)
+        print(f"[GEMINI ERR {codigo}]: {e}")
+
+    # Fallback Groq
+    try:
+        r = await asyncio.to_thread(
+            lambda: groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=msgs,
+                max_tokens=120,
+                temperature=0.92,
+            )
+        )
+        return r.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"[GROQ RESP ERR]: {e}")
         return random.choice(["hm", "q", "aff", "tá", "..."])
 
-# ─────────────────────────────────────────
-#  BOT
-# ─────────────────────────────────────────
 class Eva(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
@@ -425,7 +415,6 @@ class Eva(discord.Client):
         await init_db()
         await inicializar_humor_diario()
         asyncio.create_task(scheduler_humor())
-
         uri = os.getenv("LAVALINK_URI", "http://lavalink:2333")
         pwd = os.getenv("LAVALINK_PASSWORD", "youshallnotpass")
         nodes = [wavelink.Node(uri=uri, password=pwd)]
@@ -468,9 +457,9 @@ class Eva(discord.Client):
             if intent == "search":
                 resultado = buscar(query)
                 if resultado:
-                    extra = f"Resultado de busca (use pra responder, mas no estilo Eva): {resultado}"
+                    extra = f"Resultado de busca: {resultado}"
                 else:
-                    extra = "[busca não retornou nada. Diga que não sabe ou deboche da pergunta.]"
+                    extra = "[busca não retornou nada. Use seu conhecimento pra responder no estilo Eva, ou deboche da pergunta se for idiota.]"
 
             elif intent == "music":
                 voice = message.author.voice
@@ -488,7 +477,7 @@ class Eva(discord.Client):
                             if not tracks:
                                 tracks = await wavelink.Playable.search(f"scsearch:{query}")
                             if not tracks:
-                                extra = f"[não achou '{query}' em lugar nenhum. Zombe do gosto musical.]"
+                                extra = f"[não achou '{query}'. Zombe do gosto musical.]"
                                 await registrar_micro_evento(f"pediu '{query}' e não existia em nenhuma fonte")
                             else:
                                 track = tracks[0]
