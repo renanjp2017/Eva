@@ -4,7 +4,6 @@ import asyncio
 import os
 import json
 import re
-import wavelink
 import asyncpg
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -33,6 +32,12 @@ MODELOS_GEMINI = [
 TZ = ZoneInfo("America/Sao_Paulo")
 db_pool: asyncpg.Pool = None
 
+# canal onde Eva vai mandar mensagens espontâneas (aniversário, etc)
+CANAL_GERAL_ID: int | None = None
+
+# ─────────────────────────────────────────
+#  BANCO DE DADOS
+# ─────────────────────────────────────────
 async def init_db():
     global db_pool
     db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
@@ -46,7 +51,9 @@ async def init_db():
                 historico        JSONB DEFAULT '[]',
                 total_msgs       INTEGER DEFAULT 0,
                 primeira_vez     TIMESTAMPTZ DEFAULT NOW(),
-                ultima_interacao TIMESTAMPTZ
+                ultima_interacao TIMESTAMPTZ,
+                aniversario      TEXT,
+                ultimo_canal     TEXT
             )
         """)
         await conn.execute("""
@@ -59,6 +66,12 @@ async def init_db():
                 micro_eventos   JSONB DEFAULT '[]'
             )
         """)
+        # Adiciona colunas novas se já existia a tabela
+        for col, tipo in [("aniversario", "TEXT"), ("ultimo_canal", "TEXT")]:
+            try:
+                await conn.execute(f"ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS {col} {tipo}")
+            except Exception:
+                pass
 
 def _lista(val):
     if isinstance(val, list):
@@ -86,16 +99,13 @@ async def get_usuario(user_id: str):
 #  RESUMO DE MEMÓRIA EM BACKGROUND
 # ─────────────────────────────────────────
 async def sumarizar_historico_bg(user_id: str, historico: list):
-    """Roda em segundo plano para resumir o histórico sem travar o bot."""
     texto_historico = "\n".join(historico)
-
     prompt = f"""Resuma o histórico de conversa abaixo em no máximo 3 frases.
 Foque em reter fatos importantes sobre o usuário e o contexto da conversa.
 Ignore mensagens curtas sem importância.
 
 Histórico:
 {texto_historico}"""
-
     try:
         r = await asyncio.to_thread(
             lambda: groq_client.chat.completions.create(
@@ -107,7 +117,6 @@ Histórico:
         )
         resumo = r.choices[0].message.content.strip()
         novo_historico = [f"S: [RESUMO ANTERIOR] {resumo}"]
-
         for tentativa in range(3):
             try:
                 async with db_pool.acquire() as conn:
@@ -115,23 +124,36 @@ Histórico:
                         "UPDATE usuarios SET historico = $1::jsonb WHERE user_id = $2",
                         json.dumps(novo_historico, ensure_ascii=False), user_id
                     )
-                print(f"[MEMÓRIA] Histórico de {user_id} resumido com sucesso!")
+                print(f"[MEMÓRIA] Histórico de {user_id} resumido!")
                 break
             except (asyncpg.exceptions.PostgresError, ConnectionResetError) as db_err:
-                print(f"[MEMÓRIA DB ERR] Tentativa {tentativa + 1} falhou: {db_err}")
+                print(f"[MEMÓRIA DB ERR] Tentativa {tentativa + 1}: {db_err}")
                 await asyncio.sleep(2)
-
     except Exception as e:
-        print(f"[MEMÓRIA IA ERR] Falha ao gerar o resumo: {e}")
+        print(f"[MEMÓRIA IA ERR]: {e}")
 
-async def atualizar_usuario(user_id: str, texto: str, resposta: str, display_name: str):
+# ─────────────────────────────────────────
+#  ATUALIZAR USUÁRIO
+# ─────────────────────────────────────────
+async def atualizar_usuario(user_id: str, texto: str, resposta: str, display_name: str, channel_id: str):
     u = await get_usuario(user_id)
     fatos     = _lista(u["fatos"])
     assuntos  = _lista(u["assuntos"])
     historico = _lista(u["historico"])
     nome = u["nome"] or display_name
+    aniversario = u.get("aniversario")
 
     tl = texto.lower()
+
+    # Detecta aniversário
+    match_aniv = re.search(
+        r"(meu aniversário|meu aniver|faço anos|meu niver).{0,20}(dia\s*\d{1,2}|\d{1,2}[\/\-]\d{1,2})",
+        tl
+    )
+    if match_aniv:
+        aniversario = match_aniv.group(0)[:50]
+
+    # Detecta fatos pessoais
     gatilhos = [
         "meu nome é", "eu tenho", "eu moro", "eu trabalho", "sou de",
         "terminei", "fui demitido", "me formei", "tô namorando",
@@ -147,12 +169,12 @@ async def atualizar_usuario(user_id: str, texto: str, resposta: str, display_nam
             break
 
     temas = {
-        "música":         ["música", "banda", "show", "playlist", "álbum", "toca", "play"],
+        "música":         ["música", "banda", "show", "playlist", "álbum"],
         "relacionamento": ["namorado", "namorada", "ex", "término", "ficante", "crush", "separei"],
         "trabalho":       ["trabalho", "emprego", "chefe", "demiti", "salário", "contratado", "demitida"],
         "saúde":          ["doente", "hospital", "remédio", "dor", "médico", "internado", "ressaca"],
         "jogos":          ["jogo", "game", "partida", "ranked", "steam", "valorant", "lol"],
-        "faculdade":      ["faculdade", "prova", "aula", "nota", "professor", "trabalho escolar"],
+        "faculdade":      ["faculdade", "prova", "aula", "nota", "professor"],
     }
     for tema, palavras in temas.items():
         if any(p in tl for p in palavras):
@@ -163,13 +185,12 @@ async def atualizar_usuario(user_id: str, texto: str, resposta: str, display_nam
     historico.append(f"U:{texto}")
     historico.append(f"E:{resposta}")
 
-    disparar_resumo    = False
+    disparar_resumo = False
     historico_para_resumir = []
-
     if len(historico) >= 30:
-        disparar_resumo        = True
+        disparar_resumo = True
         historico_para_resumir = historico.copy()
-        historico              = historico[-2:]
+        historico = historico[-2:]
 
     async with db_pool.acquire() as conn:
         await conn.execute("""
@@ -179,12 +200,16 @@ async def atualizar_usuario(user_id: str, texto: str, resposta: str, display_nam
                 assuntos         = $4::jsonb,
                 historico        = $5::jsonb,
                 total_msgs       = total_msgs + 1,
-                ultima_interacao = NOW()
+                ultima_interacao = NOW(),
+                aniversario      = $6,
+                ultimo_canal     = $7
             WHERE user_id = $1
         """, user_id, nome,
-            json.dumps(fatos,     ensure_ascii=False),
-            json.dumps(assuntos,  ensure_ascii=False),
-            json.dumps(historico, ensure_ascii=False)
+            json.dumps(fatos,    ensure_ascii=False),
+            json.dumps(assuntos, ensure_ascii=False),
+            json.dumps(historico,ensure_ascii=False),
+            aniversario,
+            channel_id
         )
 
     if disparar_resumo:
@@ -210,6 +235,124 @@ async def contexto_usuario(user_id: str):
         partes.append("já se conhecem")
     return " | ".join(partes) if partes else "desconhecida"
 
+# ─────────────────────────────────────────
+#  ANIVERSÁRIOS
+# ─────────────────────────────────────────
+async def checar_aniversarios(client: discord.Client):
+    """Roda uma vez por dia e manda mensagem de aniversário no canal certo."""
+    hoje = datetime.now(TZ)
+    dia_mes = f"{hoje.day}/{hoje.month}"
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT user_id, nome, aniversario, ultimo_canal FROM usuarios WHERE aniversario IS NOT NULL"
+        )
+
+    for row in rows:
+        aniv = row["aniversario"] or ""
+        # Verifica se o dia/mês aparece no texto guardado
+        if dia_mes not in aniv and f"{hoje.day:02d}/{hoje.month:02d}" not in aniv:
+            continue
+
+        nome = row["nome"] or "essa pessoa"
+        canal_id = row["ultimo_canal"]
+        if not canal_id:
+            continue
+
+        canal = client.get_channel(int(canal_id))
+        if not canal:
+            continue
+
+        humor = await descrever_humor_atual()
+        prompt = f"""{PERSONALIDADE}
+
+{humor}
+
+Hoje é aniversário de {nome}. Mande uma mensagem no canal comentando isso do seu jeito — pode ser irônica, pode zoar, pode ser levemente calorosa mas nunca cafona. Varie. Pode comentar que ninguém lembrou, pode zoar o presente que vão dar, pode fingir que não liga mas mandar mesmo assim. Máximo 2 linhas."""
+
+        try:
+            resposta = await gerar_resposta_raw(prompt)
+            await canal.send(resposta)
+            print(f"[ANIVERSÁRIO] Mensagem enviada pra {nome}")
+        except Exception as e:
+            print(f"[ANIVERSÁRIO ERR]: {e}")
+
+async def scheduler_aniversarios(client: discord.Client):
+    while True:
+        agora   = datetime.now(TZ)
+        proximo = agora.replace(hour=10, minute=0, second=0, microsecond=0)
+        if agora >= proximo:
+            proximo += timedelta(days=1)
+        await asyncio.sleep((proximo - agora).total_seconds())
+        await checar_aniversarios(client)
+
+# ─────────────────────────────────────────
+#  GATILHOS ESPONTÂNEOS (20% de chance)
+# ─────────────────────────────────────────
+GATILHOS_ESPONTANEOS = [
+    # relacionamento
+    (r"\bterminei\b|\bme separei\b|\bfui largad[oa]\b", "alguém acabou de terminar um relacionamento"),
+    (r"\btô apaixonad[oa]\b|\bstou apaixonad[oa]\b|\bto apaixonad[oa]\b", "alguém declarou que tá apaixonado"),
+    (r"\bficamos\b|\bfiquei com\b", "alguém ficou com alguém"),
+    # trabalho/vida
+    (r"\bfui demitid[oa]\b|\bperdi o emprego\b|\bfui mandat[oa] embora\b", "alguém foi demitido"),
+    (r"\bpassei na prova\b|\bpassei no vestibular\b|\bpassei na facul\b", "alguém passou em algo importante"),
+    (r"\breprovei\b|\btombei\b|\blevei bomba\b", "alguém reprovou ou tombou em algo"),
+    (r"\bme formei\b|\bformatura\b", "alguém se formou"),
+    # saúde/humor
+    (r"\btô de ressaca\b|\bto de ressaca\b|\bressacad[oa]\b", "alguém tá de ressaca"),
+    (r"\btô doente\b|\bto doente\b|\bfui ao médico\b|\bfui no médico\b", "alguém tá doente"),
+    (r"\btô chorando\b|\bto chorando\b|\bchorei\b", "alguém tá chorando"),
+    # dinheiro
+    (r"\bfiquei sem grana\b|\bestou sem dinheiro\b|\btô broke\b|\btô liso\b|\bto liso\b", "alguém tá sem dinheiro"),
+    (r"\btomei no\b|\btomei uma\b|\bme roubaram\b", "alguém foi lesado ou tomou um golpe"),
+    # conquistas
+    (r"\bcomprei\b.{0,20}\b(carro|moto|casa|apartamento|iphone|celular)\b", "alguém fez uma compra grande"),
+    (r"\bfui promovid[oa]\b|\bganhei aumento\b", "alguém foi promovido"),
+    # social
+    (r"\bfui na festa\b|\btô na festa\b|\bto na festa\b|\bfui num show\b", "alguém foi numa festa ou show"),
+    (r"\bme chamaram de\b|\bme xingaram\b", "alguém foi chamado de algo ou xingado"),
+    (r"\btô com sono\b|\bto com sono\b|\bnão consigo dormir\b|\bnao consigo dormir\b", "alguém tá com sono ou insone"),
+    (r"\btô com fome\b|\bto com fome\b|\bestou morrendo de fome\b", "alguém tá com fome"),
+    (r"\bperdi meu\b|\bperdi minha\b", "alguém perdeu algo"),
+    (r"\bque tédio\b|\bque saudade\b|\bque raiva\b|\bque ódio\b", "alguém expressou uma emoção forte"),
+]
+
+async def verificar_gatilho_espontaneo(message: discord.Message, client: discord.Client):
+    """Verifica gatilhos e responde com 20% de chance sem ser mencionada."""
+    tl = message.content.lower()
+    for padrao, contexto in GATILHOS_ESPONTANEOS:
+        if re.search(padrao, tl):
+            if random.random() > 0.20:
+                return
+            # 30% de chance de só reagir com emoji em vez de texto
+            if random.random() < 0.30:
+                emojis = ["💀", "😐", "🙂", "👁️", "😶", "🫠", "💅", "🤌", "😒", "👀"]
+                try:
+                    await message.add_reaction(random.choice(emojis))
+                except Exception:
+                    pass
+                return
+
+            humor = await descrever_humor_atual()
+            nome = message.author.display_name
+            prompt = f"""{PERSONALIDADE}
+
+{humor}
+
+Contexto: {contexto}. Quem disse isso foi {nome}.
+Reaja a isso do seu jeito — sem ser chamada, sem ser perguntada. Pode ignorar partes, pode zoar, pode ser indiferente. Máximo 1-2 linhas. Não comece com o nome da pessoa."""
+
+            try:
+                resposta = await gerar_resposta_raw(prompt)
+                await message.reply(resposta, mention_author=False)
+            except Exception as e:
+                print(f"[GATILHO ERR]: {e}")
+            return
+
+# ─────────────────────────────────────────
+#  SISTEMA DE HUMOR
+# ─────────────────────────────────────────
 PRESETS_BASE = [
     ("letárgica",       "acordou sem motivo pra existir, tudo parece inútil, fala o mínimo",                 15),
     ("entediada",       "nada é interessante, responde com indiferença olimpiana",                            20),
@@ -323,35 +466,20 @@ async def scheduler_humor():
         await asyncio.sleep((proximo - agora).total_seconds())
         await inicializar_humor_diario()
 
-MUSIC_REGEX = re.compile(
-    r"^(play|toca|m!play|\.play|tocar)\s+.+|"
-    r"^(skip|pula|m!skip|\.skip|próxima|proxima)\b|"
-    r"^(stop|para|m!stop|\.stop|sai do canal)\b",
-    re.IGNORECASE
-)
-
+# ─────────────────────────────────────────
+#  ROTEADOR DE INTENÇÃO
+# ─────────────────────────────────────────
 async def classificar_intencao(texto: str) -> dict:
-    if MUSIC_REGEX.match(texto):
-        tl = texto.lower()
-        if any(w in tl for w in ["skip", "pula", "próxima", "proxima"]):
-            return {"intent": "music", "action": "skip", "query": texto}
-        if any(w in tl for w in ["stop", "para", "sai do canal"]):
-            return {"intent": "music", "action": "stop", "query": texto}
-        query = re.sub(r"^(play|toca|m!play|\.play|tocar)\s+", "", texto, flags=re.IGNORECASE).strip()
-        return {"intent": "music", "action": "play", "query": query}
-
     prompt = f"""Analise e retorne APENAS JSON válido, sem markdown.
 Mensagem: "{texto}"
 
 Regras:
-- "intent": "music" se quer tocar/parar/pular música
 - "intent": "search" se é pergunta factual, notícia, "quem é", "o que é", "quando foi"
 - "intent": "chat" para conversa normal
-- "action": "play"/"skip"/"stop" apenas se intent=music, senão "none"
+- "action": "none"
 - "query": termo limpo
 
 Exemplos:
-{{"intent":"music","action":"play","query":"linkin park"}}
 {{"intent":"search","action":"none","query":"quem ganhou a copa 2006"}}
 {{"intent":"chat","action":"none","query":"{texto}"}}"""
 
@@ -370,6 +498,9 @@ Exemplos:
         print(f"[GROQ ROUTER ERR]: {e}")
         return {"intent": "chat", "action": "none", "query": texto}
 
+# ─────────────────────────────────────────
+#  BUSCA
+# ─────────────────────────────────────────
 def buscar(query: str) -> str:
     try:
         with DDGS() as ddgs:
@@ -382,6 +513,9 @@ def buscar(query: str) -> str:
         print(f"[DDGS ERR]: {e}")
         return ""
 
+# ─────────────────────────────────────────
+#  PERSONALIDADE
+# ─────────────────────────────────────────
 PERSONALIDADE = """Você é Eva, 20 anos, brasileira, gótica.
 
 TRAÇOS FIXOS:
@@ -405,26 +539,47 @@ PESSOAS QUE VOCÊ CONHECE NO SERVIDOR:
 O HUMOR DO DIA modifica COMO ela expressa esses traços — não quem ela é.
 Siga o humor descrito abaixo sem anunciá-lo. Seja orgânica."""
 
+# ─────────────────────────────────────────
+#  GERAÇÃO DE RESPOSTA
+# ─────────────────────────────────────────
 def _montar_historico_gemini(historico: list) -> list:
     contents = []
     for linha in historico[-12:]:
         if linha.startswith("U:"):
-            contents.append(types.Content(
-                role="user",
-                parts=[types.Part(text=linha[2:])]
-            ))
+            contents.append(types.Content(role="user",  parts=[types.Part(text=linha[2:])]))
         elif linha.startswith("E:"):
-            contents.append(types.Content(
-                role="model",
-                parts=[types.Part(text=linha[2:])]
-            ))
+            contents.append(types.Content(role="model", parts=[types.Part(text=linha[2:])]))
         elif linha.startswith("S:"):
-            # Resumo anterior — injeta como contexto do model
-            contents.append(types.Content(
-                role="model",
-                parts=[types.Part(text=linha[2:])]
-            ))
+            contents.append(types.Content(role="model", parts=[types.Part(text=linha[2:])]))
     return contents
+
+async def gerar_resposta_raw(prompt: str) -> str:
+    """Gera resposta a partir de um prompt simples (sem histórico)."""
+    for modelo in MODELOS_GEMINI:
+        try:
+            r = await asyncio.to_thread(
+                lambda m=modelo: gemini_client.models.generate_content(
+                    model=m,
+                    contents=[types.Content(role="user", parts=[types.Part(text=prompt)])],
+                    config=types.GenerateContentConfig(max_output_tokens=120, temperature=0.95)
+                )
+            )
+            return r.text.strip()
+        except Exception as e:
+            print(f"[GEMINI ERR {modelo}]: {e}")
+            continue
+    try:
+        r = await asyncio.to_thread(
+            lambda: groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=120, temperature=0.92,
+            )
+        )
+        return r.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"[GROQ ERR]: {e}")
+    return random.choice(["hm", "q", "aff", "tá", "..."])
 
 async def gerar_resposta(user_id: str, query: str, contexto_extra: str = "") -> str:
     humor = await descrever_humor_atual()
@@ -438,12 +593,8 @@ async def gerar_resposta(user_id: str, query: str, contexto_extra: str = "") -> 
     historico = _lista(u["historico"])
 
     contents = _montar_historico_gemini(historico)
-    contents.append(types.Content(
-        role="user",
-        parts=[types.Part(text=query)]
-    ))
+    contents.append(types.Content(role="user", parts=[types.Part(text=query)]))
 
-    # Tenta cada modelo Gemini em ordem
     for modelo in MODELOS_GEMINI:
         try:
             r = await asyncio.to_thread(
@@ -463,18 +614,14 @@ async def gerar_resposta(user_id: str, query: str, contexto_extra: str = "") -> 
             print(f"[GEMINI ERR {modelo}]: {e}")
             continue
 
-    # Fallback Groq
     try:
         msgs = [{"role": "system", "content": system}]
         for linha in historico[-12:]:
             if linha.startswith("U:"):
                 msgs.append({"role": "user",      "content": linha[2:]})
-            elif linha.startswith("E:"):
-                msgs.append({"role": "assistant", "content": linha[2:]})
-            elif linha.startswith("S:"):
+            elif linha.startswith(("E:", "S:")):
                 msgs.append({"role": "assistant", "content": linha[2:]})
         msgs.append({"role": "user", "content": query})
-
         r = await asyncio.to_thread(
             lambda: groq_client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
@@ -490,6 +637,9 @@ async def gerar_resposta(user_id: str, query: str, contexto_extra: str = "") -> 
 
     return random.choice(["hm", "q", "aff", "tá", "..."])
 
+# ─────────────────────────────────────────
+#  BOT
+# ─────────────────────────────────────────
 class Eva(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
@@ -500,17 +650,10 @@ class Eva(discord.Client):
         await init_db()
         await inicializar_humor_diario()
         asyncio.create_task(scheduler_humor())
-        uri = os.getenv("LAVALINK_URI", "http://lavalink:2333")
-        pwd = os.getenv("LAVALINK_PASSWORD", "youshallnotpass")
-        nodes = [wavelink.Node(uri=uri, password=pwd)]
-        await wavelink.Pool.connect(nodes=nodes, client=self, cache_capacity=100)
+        asyncio.create_task(scheduler_aniversarios(self))
 
     async def on_ready(self):
         print(f"[EVA] Online: {self.user}")
-
-    async def on_wavelink_track_end(self, payload: wavelink.TrackEndEventPayload):
-        if not payload.player.queue.is_empty:
-            await payload.player.play(payload.player.queue.get())
 
     async def on_message(self, message: discord.Message):
         if message.author.bot:
@@ -521,13 +664,15 @@ class Eva(discord.Client):
 
         mencionada  = self.user in message.mentions
         nome_citado = bool(re.search(r'\beva\b', tl))
-        music_cmd   = bool(MUSIC_REGEX.match(tl))
 
-        if not (mencionada or nome_citado or music_cmd):
+        # Verifica gatilhos espontâneos em todas as mensagens
+        if not mencionada and not nome_citado:
+            asyncio.create_task(verificar_gatilho_espontaneo(message, self))
             return
 
         user_id     = str(message.author.id)
         display     = message.author.display_name
+        channel_id  = str(message.channel.id)
         texto_limpo = re.sub(r'<@!?\d+>', '', texto).strip()
 
         async with message.channel.typing():
@@ -535,7 +680,6 @@ class Eva(discord.Client):
 
             intent_data = await classificar_intencao(texto_limpo)
             intent = intent_data.get("intent", "chat")
-            action = intent_data.get("action", "none")
             query  = intent_data.get("query", texto_limpo)
             extra  = ""
 
@@ -546,51 +690,8 @@ class Eva(discord.Client):
                 else:
                     extra = "[busca não retornou nada. Use seu conhecimento pra responder no estilo Eva, ou deboche da pergunta se for idiota.]"
 
-            elif intent == "music":
-                voice = message.author.voice
-                if not voice:
-                    extra = "[pediu música sem estar em canal de voz. Deboche.]"
-                    await registrar_micro_evento("alguém pediu música sem estar no canal de voz")
-                else:
-                    vc: wavelink.Player = message.guild.voice_client
-                    if not vc:
-                        vc = await voice.channel.connect(cls=wavelink.Player)
-
-                    if action == "play":
-                        try:
-                            tracks = await wavelink.Playable.search(f"ytmsearch:{query}")
-                            if not tracks:
-                                tracks = await wavelink.Playable.search(f"scsearch:{query}")
-                            if not tracks:
-                                extra = f"[não achou '{query}'. Zombe do gosto musical.]"
-                                await registrar_micro_evento(f"pediu '{query}' e não existia")
-                            else:
-                                track = tracks[0]
-                                await vc.queue.put_wait(track)
-                                if not vc.playing:
-                                    await vc.play(vc.queue.get())
-                                extra = f"[colocou '{track.title}' na fila. Reclame do gosto musical mas toque mesmo.]"
-                                await registrar_micro_evento(f"obrigada a tocar '{track.title}'")
-                        except Exception as e:
-                            print(f"[LAVALINK ERR]: {e}")
-                            extra = "[erro no servidor de música. Fique irritada com a tecnologia.]"
-
-                    elif action == "skip":
-                        if vc and vc.playing:
-                            await vc.skip(force=True)
-                            extra = "[pulou a música. Diga que era horrível mesmo.]"
-                        else:
-                            extra = "[pediu pra pular mas não tem nada tocando. Chame de distraído.]"
-
-                    elif action == "stop":
-                        if vc:
-                            await vc.disconnect()
-                            extra = "[parou tudo e saiu do canal. Expresse alívio.]"
-                        else:
-                            extra = "[pediu pra parar mas nem estava lá. Deboche.]"
-
             resposta = await gerar_resposta(user_id, query, extra)
-            await atualizar_usuario(user_id, texto_limpo, resposta, display)
+            await atualizar_usuario(user_id, texto_limpo, resposta, display, channel_id)
             await message.reply(resposta)
 
 
