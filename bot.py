@@ -24,6 +24,12 @@ DATABASE_URL   = os.getenv("DATABASE_URL")
 groq_client   = OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
+MODELOS_GEMINI = [
+    "gemini-3.5-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-1.5-flash-8b",
+]
+
 TZ = ZoneInfo("America/Sao_Paulo")
 db_pool: asyncpg.Pool = None
 
@@ -76,6 +82,48 @@ async def get_usuario(user_id: str):
             row = await conn.fetchrow("SELECT * FROM usuarios WHERE user_id = $1", user_id)
         return dict(row)
 
+# ─────────────────────────────────────────
+#  RESUMO DE MEMÓRIA EM BACKGROUND
+# ─────────────────────────────────────────
+async def sumarizar_historico_bg(user_id: str, historico: list):
+    """Roda em segundo plano para resumir o histórico sem travar o bot."""
+    texto_historico = "\n".join(historico)
+
+    prompt = f"""Resuma o histórico de conversa abaixo em no máximo 3 frases.
+Foque em reter fatos importantes sobre o usuário e o contexto da conversa.
+Ignore mensagens curtas sem importância.
+
+Histórico:
+{texto_historico}"""
+
+    try:
+        r = await asyncio.to_thread(
+            lambda: groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=100,
+                temperature=0.3,
+            )
+        )
+        resumo = r.choices[0].message.content.strip()
+        novo_historico = [f"S: [RESUMO ANTERIOR] {resumo}"]
+
+        for tentativa in range(3):
+            try:
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE usuarios SET historico = $1::jsonb WHERE user_id = $2",
+                        json.dumps(novo_historico, ensure_ascii=False), user_id
+                    )
+                print(f"[MEMÓRIA] Histórico de {user_id} resumido com sucesso!")
+                break
+            except (asyncpg.exceptions.PostgresError, ConnectionResetError) as db_err:
+                print(f"[MEMÓRIA DB ERR] Tentativa {tentativa + 1} falhou: {db_err}")
+                await asyncio.sleep(2)
+
+    except Exception as e:
+        print(f"[MEMÓRIA IA ERR] Falha ao gerar o resumo: {e}")
+
 async def atualizar_usuario(user_id: str, texto: str, resposta: str, display_name: str):
     u = await get_usuario(user_id)
     fatos     = _lista(u["fatos"])
@@ -114,8 +162,14 @@ async def atualizar_usuario(user_id: str, texto: str, resposta: str, display_nam
 
     historico.append(f"U:{texto}")
     historico.append(f"E:{resposta}")
-    if len(historico) > 30:
-        historico = historico[-30:]
+
+    disparar_resumo    = False
+    historico_para_resumir = []
+
+    if len(historico) >= 30:
+        disparar_resumo        = True
+        historico_para_resumir = historico.copy()
+        historico              = historico[-2:]
 
     async with db_pool.acquire() as conn:
         await conn.execute("""
@@ -132,6 +186,9 @@ async def atualizar_usuario(user_id: str, texto: str, resposta: str, display_nam
             json.dumps(assuntos,  ensure_ascii=False),
             json.dumps(historico, ensure_ascii=False)
         )
+
+    if disparar_resumo:
+        asyncio.create_task(sumarizar_historico_bg(user_id, historico_para_resumir))
 
 async def contexto_usuario(user_id: str):
     u = await get_usuario(user_id)
@@ -349,7 +406,6 @@ O HUMOR DO DIA modifica COMO ela expressa esses traços — não quem ela é.
 Siga o humor descrito abaixo sem anunciá-lo. Seja orgânica."""
 
 def _montar_historico_gemini(historico: list) -> list:
-    """Converte histórico pro formato de contents do google-genai."""
     contents = []
     for linha in historico[-12:]:
         if linha.startswith("U:"):
@@ -358,6 +414,12 @@ def _montar_historico_gemini(historico: list) -> list:
                 parts=[types.Part(text=linha[2:])]
             ))
         elif linha.startswith("E:"):
+            contents.append(types.Content(
+                role="model",
+                parts=[types.Part(text=linha[2:])]
+            ))
+        elif linha.startswith("S:"):
+            # Resumo anterior — injeta como contexto do model
             contents.append(types.Content(
                 role="model",
                 parts=[types.Part(text=linha[2:])]
@@ -375,36 +437,41 @@ async def gerar_resposta(user_id: str, query: str, contexto_extra: str = "") -> 
     u = await get_usuario(user_id)
     historico = _lista(u["historico"])
 
-    # 1. Gemini 1.5 Flash via google-genai
-    try:
-        contents = _montar_historico_gemini(historico)
-        contents.append(types.Content(
-            role="user",
-            parts=[types.Part(text=query)]
-        ))
+    contents = _montar_historico_gemini(historico)
+    contents.append(types.Content(
+        role="user",
+        parts=[types.Part(text=query)]
+    ))
 
-        r = await asyncio.to_thread(
-            lambda: gemini_client.models.generate_content(
-                model="gemini-1.5-flash",
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=system,
-                    max_output_tokens=120,
-                    temperature=0.95,
+    # Tenta cada modelo Gemini em ordem
+    for modelo in MODELOS_GEMINI:
+        try:
+            r = await asyncio.to_thread(
+                lambda m=modelo: gemini_client.models.generate_content(
+                    model=m,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system,
+                        max_output_tokens=120,
+                        temperature=0.95,
+                    )
                 )
             )
-        )
-        return r.text.strip()
-    except Exception as e:
-        print(f"[GEMINI ERR]: {e}")
+            print(f"[GEMINI] {modelo}")
+            return r.text.strip()
+        except Exception as e:
+            print(f"[GEMINI ERR {modelo}]: {e}")
+            continue
 
-    # 2. Fallback Groq
+    # Fallback Groq
     try:
         msgs = [{"role": "system", "content": system}]
         for linha in historico[-12:]:
             if linha.startswith("U:"):
                 msgs.append({"role": "user",      "content": linha[2:]})
             elif linha.startswith("E:"):
+                msgs.append({"role": "assistant", "content": linha[2:]})
+            elif linha.startswith("S:"):
                 msgs.append({"role": "assistant", "content": linha[2:]})
         msgs.append({"role": "user", "content": query})
 
