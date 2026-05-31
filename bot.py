@@ -15,11 +15,10 @@ from openai import OpenAI
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-GROK_API_KEY  = os.getenv("GROK_API_KEY")
 GROQ_API_KEY  = os.getenv("GROQ_API_KEY")
 DATABASE_URL  = os.getenv("DATABASE_URL")
 
-grok_client = OpenAI(api_key=GROK_API_KEY, base_url="https://api.x.ai/v1")
+# Groq pra tudo — gratuito e funcional
 groq_client = OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
 
 TZ = ZoneInfo("America/Sao_Paulo")
@@ -35,13 +34,13 @@ async def init_db():
     async with db_pool.acquire() as conn:
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS usuarios (
-                user_id     TEXT PRIMARY KEY,
-                nome        TEXT,
-                fatos       JSONB DEFAULT '[]',
-                assuntos    JSONB DEFAULT '[]',
-                historico   JSONB DEFAULT '[]',
-                total_msgs  INTEGER DEFAULT 0,
-                primeira_vez TIMESTAMPTZ DEFAULT NOW(),
+                user_id          TEXT PRIMARY KEY,
+                nome             TEXT,
+                fatos            JSONB DEFAULT '[]',
+                assuntos         JSONB DEFAULT '[]',
+                historico        JSONB DEFAULT '[]',
+                total_msgs       INTEGER DEFAULT 0,
+                primeira_vez     TIMESTAMPTZ DEFAULT NOW(),
                 ultima_interacao TIMESTAMPTZ
             )
         """)
@@ -59,6 +58,18 @@ async def init_db():
 # ─────────────────────────────────────────
 #  MEMÓRIA POR USUÁRIO
 # ─────────────────────────────────────────
+def _lista(val):
+    """Garante que o valor retornado do banco seja sempre uma lista."""
+    if isinstance(val, list):
+        return val
+    if isinstance(val, str):
+        try:
+            parsed = json.loads(val)
+            return parsed if isinstance(parsed, list) else []
+        except Exception:
+            return []
+    return []
+
 async def get_usuario(user_id: str):
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT * FROM usuarios WHERE user_id = $1", user_id)
@@ -72,11 +83,10 @@ async def get_usuario(user_id: str):
 
 async def atualizar_usuario(user_id: str, texto: str, resposta: str, display_name: str):
     u = await get_usuario(user_id)
-    fatos    = u["fatos"] or []
-    assuntos = u["assuntos"] or []
-    historico= u["historico"] or []
+    fatos     = _lista(u["fatos"])
+    assuntos  = _lista(u["assuntos"])
+    historico = _lista(u["historico"])
 
-    # Nome
     nome = u["nome"] or display_name
 
     # Detecta fatos pessoais
@@ -97,12 +107,12 @@ async def atualizar_usuario(user_id: str, texto: str, resposta: str, display_nam
 
     # Detecta temas
     temas = {
-        "música":        ["música", "banda", "show", "playlist", "álbum", "toca", "play"],
-        "relacionamento":["namorado", "namorada", "ex", "término", "ficante", "crush", "separei"],
-        "trabalho":      ["trabalho", "emprego", "chefe", "demiti", "salário", "contratado", "demitida"],
-        "saúde":         ["doente", "hospital", "remédio", "dor", "médico", "internado", "ressaca"],
-        "jogos":         ["jogo", "game", "partida", "ranked", "steam", "valorant", "lol"],
-        "faculdade":     ["faculdade", "prova", "aula", "nota", "professor", "trabalho escolar"],
+        "música":         ["música", "banda", "show", "playlist", "álbum", "toca", "play"],
+        "relacionamento": ["namorado", "namorada", "ex", "término", "ficante", "crush", "separei"],
+        "trabalho":       ["trabalho", "emprego", "chefe", "demiti", "salário", "contratado", "demitida"],
+        "saúde":          ["doente", "hospital", "remédio", "dor", "médico", "internado", "ressaca"],
+        "jogos":          ["jogo", "game", "partida", "ranked", "steam", "valorant", "lol"],
+        "faculdade":      ["faculdade", "prova", "aula", "nota", "professor", "trabalho escolar"],
     }
     for tema, palavras in temas.items():
         if any(p in tl for p in palavras):
@@ -118,16 +128,16 @@ async def atualizar_usuario(user_id: str, texto: str, resposta: str, display_nam
     async with db_pool.acquire() as conn:
         await conn.execute("""
             UPDATE usuarios SET
-                nome = $2,
-                fatos = $3::jsonb,
-                assuntos = $4::jsonb,
-                historico = $5::jsonb,
-                total_msgs = total_msgs + 1,
+                nome             = $2,
+                fatos            = $3::jsonb,
+                assuntos         = $4::jsonb,
+                historico        = $5::jsonb,
+                total_msgs       = total_msgs + 1,
                 ultima_interacao = NOW()
             WHERE user_id = $1
         """, user_id, nome,
-            json.dumps(fatos, ensure_ascii=False),
-            json.dumps(assuntos, ensure_ascii=False),
+            json.dumps(fatos,     ensure_ascii=False),
+            json.dumps(assuntos,  ensure_ascii=False),
             json.dumps(historico, ensure_ascii=False)
         )
 
@@ -136,10 +146,10 @@ async def contexto_usuario(user_id: str):
     partes = []
     if u["nome"]:
         partes.append(f"nome: {u['nome']}")
-    fatos = u["fatos"] or []
+    fatos = _lista(u["fatos"])
     if fatos:
         partes.append(f"sabe sobre ela: {' | '.join(fatos[-4:])}")
-    assuntos = u["assuntos"] or []
+    assuntos = _lista(u["assuntos"])
     if assuntos:
         partes.append(f"assuntos frequentes: {', '.join(assuntos)}")
     total = u["total_msgs"] or 0
@@ -155,17 +165,17 @@ async def contexto_usuario(user_id: str):
 #  SISTEMA DE HUMOR
 # ─────────────────────────────────────────
 PRESETS_BASE = [
-    ("letárgica",       "acordou sem motivo pra existir, tudo parece inútil, fala o mínimo",                    15),
-    ("entediada",       "nada é interessante, responde com indiferença olimpiana",                               20),
-    ("irritada",        "tudo irrita, paciência zerada, curta e grossa",                                        15),
-    ("sarcástica-plus", "sarcasmo no limite, cada frase é uma facada disfarçada de observação",                 18),
-    ("curiosa-fria",    "genuinamente interessada mas finge que não tá, faz perguntas cortantes",               10),
-    ("maldosa-animada", "tá de bom humor mas esse bom humor se manifesta provocando todo mundo",                12),
-    ("melancólica",     "pensativa, meio distante, responde mas parece que tá em outro lugar",                   8),
-    ("caótica",         "humor impossível de prever, muda de tom no meio da frase, imprevisível",                7),
-    ("ressaquenta",     "de ressaca com energia nervosa, brava mas presente",                                    5),
-    ("rainha-do-drama", "tudo é uma tragédia pessoal, exagera cada coisa",                                       5),
-    ("evento_especial", "PLACEHOLDER",                                                                           5),
+    ("letárgica",       "acordou sem motivo pra existir, tudo parece inútil, fala o mínimo",                 15),
+    ("entediada",       "nada é interessante, responde com indiferença olimpiana",                            20),
+    ("irritada",        "tudo irrita, paciência zerada, curta e grossa",                                     15),
+    ("sarcástica-plus", "sarcasmo no limite, cada frase é uma facada disfarçada de observação",              18),
+    ("curiosa-fria",    "genuinamente interessada mas finge que não tá, faz perguntas cortantes",            10),
+    ("maldosa-animada", "tá de bom humor mas esse bom humor se manifesta provocando todo mundo",             12),
+    ("melancólica",     "pensativa, meio distante, responde mas parece que tá em outro lugar",                8),
+    ("caótica",         "humor impossível de prever, muda de tom no meio da frase, imprevisível",             7),
+    ("ressaquenta",     "de ressaca com energia nervosa, brava mas presente",                                  5),
+    ("rainha-do-drama", "tudo é uma tragédia pessoal, exagera cada coisa",                                    5),
+    ("evento_especial", "PLACEHOLDER",                                                                         5),
 ]
 
 EVENTOS_RAROS = [
@@ -197,12 +207,10 @@ def _drift_atual():
     return ""
 
 def sortear_preset():
-    nomes = [p[0] for p in PRESETS_BASE]
-    descs = [p[1] for p in PRESETS_BASE]
     pesos = [p[2] for p in PRESETS_BASE]
     idx   = random.choices(range(len(PRESETS_BASE)), weights=pesos, k=1)[0]
-    nome  = nomes[idx]
-    desc  = descs[idx]
+    nome  = PRESETS_BASE[idx][0]
+    desc  = PRESETS_BASE[idx][1]
     if nome == "evento_especial":
         evento = random.choice(EVENTOS_RAROS)
         desc   = f"hoje aconteceu algo: {evento}. isso está colorindo tudo que ela faz"
@@ -214,18 +222,13 @@ async def inicializar_humor_diario():
         row = await conn.fetchrow("SELECT * FROM humor WHERE data = $1", hoje)
         if row:
             return
-
-        anterior = await conn.fetchrow(
-            "SELECT preset_nome FROM humor ORDER BY data DESC LIMIT 1"
-        )
+        anterior = await conn.fetchrow("SELECT preset_nome FROM humor ORDER BY data DESC LIMIT 1")
         preset_anterior = anterior["preset_nome"] if anterior else None
-
         nome, desc = sortear_preset()
         if nome == preset_anterior and nome not in ("evento_especial", "caótica"):
             nome2, desc2 = sortear_preset()
             if nome2 != preset_anterior:
                 nome, desc = nome2, desc2
-
         await conn.execute("""
             INSERT INTO humor (data, preset_nome, preset_desc, preset_anterior, micro_eventos)
             VALUES ($1, $2, $3, $4, '[]'::jsonb)
@@ -239,7 +242,7 @@ async def registrar_micro_evento(descricao: str):
         row = await conn.fetchrow("SELECT micro_eventos FROM humor WHERE data = $1", hoje)
         if not row:
             return
-        eventos = row["micro_eventos"] or []
+        eventos = _lista(row["micro_eventos"])
         eventos.append(descricao)
         eventos = eventos[-5:]
         await conn.execute(
@@ -249,14 +252,14 @@ async def registrar_micro_evento(descricao: str):
 
 async def descrever_humor_atual():
     await inicializar_humor_diario()
-    hoje = datetime.now(TZ).date()
-    hora = datetime.now(TZ).hour
+    hoje  = datetime.now(TZ).date()
+    hora  = datetime.now(TZ).hour
     drift = _drift_atual()
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT * FROM humor WHERE data = $1", hoje)
     if not row:
         return f"HUMOR BASE: entediada\nHORA: {hora}h — {drift}"
-    micro = row["micro_eventos"] or []
+    micro  = _lista(row["micro_eventos"])
     partes = [
         f"HUMOR BASE DE HOJE: {row['preset_desc']}",
         f"HORA ATUAL: {hora}h — {drift}",
@@ -285,7 +288,6 @@ MUSIC_REGEX = re.compile(
 )
 
 async def classificar_intencao(texto: str) -> dict:
-    # Regex rápido primeiro
     if MUSIC_REGEX.match(texto):
         tl = texto.lower()
         if any(w in tl for w in ["skip", "pula", "próxima", "proxima"]):
@@ -322,7 +324,7 @@ Exemplos:
         )
         return json.loads(r.choices[0].message.content)
     except Exception as e:
-        print(f"[GROQ ERR]: {e}")
+        print(f"[GROQ ROUTER ERR]: {e}")
         return {"intent": "chat", "action": "none", "query": texto}
 
 # ─────────────────────────────────────────
@@ -343,7 +345,7 @@ def buscar(query: str) -> str:
             if isinstance(t, dict) and "Text" in t
         ]
         return " ".join(tops) if tops else ""
-    except:
+    except Exception:
         return ""
 
 # ─────────────────────────────────────────
@@ -371,7 +373,7 @@ O HUMOR DO DIA modifica COMO ela expressa esses traços — não quem ela é.
 Siga o humor descrito abaixo sem anunciá-lo. Seja orgânica."""
 
 # ─────────────────────────────────────────
-#  GERAÇÃO DE RESPOSTA (GROK)
+#  GERAÇÃO DE RESPOSTA (GROQ — llama)
 # ─────────────────────────────────────────
 async def gerar_resposta(user_id: str, query: str, contexto_extra: str = "") -> str:
     humor = await descrever_humor_atual()
@@ -382,7 +384,7 @@ async def gerar_resposta(user_id: str, query: str, contexto_extra: str = "") -> 
         system += f"\n\nCONTEXTO: {contexto_extra}"
 
     u = await get_usuario(user_id)
-    historico = u["historico"] or []
+    historico = _lista(u["historico"])
 
     msgs = [{"role": "system", "content": system}]
     for linha in historico[-12:]:
@@ -394,8 +396,8 @@ async def gerar_resposta(user_id: str, query: str, contexto_extra: str = "") -> 
 
     try:
         r = await asyncio.to_thread(
-            lambda: grok_client.chat.completions.create(
-                model="grok-3",
+            lambda: groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
                 messages=msgs,
                 max_tokens=120,
                 temperature=0.92,
@@ -403,7 +405,7 @@ async def gerar_resposta(user_id: str, query: str, contexto_extra: str = "") -> 
         )
         return r.choices[0].message.content.strip()
     except Exception as e:
-        print(f"[GROK ERR]: {e}")
+        print(f"[GROQ RESP ERR]: {e}")
         return random.choice(["hm", "q", "aff", "tá", "..."])
 
 # ─────────────────────────────────────────
@@ -420,7 +422,6 @@ class Eva(discord.Client):
         await inicializar_humor_diario()
         asyncio.create_task(scheduler_humor())
 
-        # Lavalink com PO Token / YouTube Source plugin
         uri = os.getenv("LAVALINK_URI", "http://lavalink:2333")
         pwd = os.getenv("LAVALINK_PASSWORD", "youshallnotpass")
         nodes = [wavelink.Node(uri=uri, password=pwd)]
@@ -481,10 +482,8 @@ class Eva(discord.Client):
 
                     if action == "play":
                         try:
-                            # Tenta YouTube via plugin youtube-source (suporta PO Token)
                             tracks = await wavelink.Playable.search(f"ytsearch:{query}")
                             if not tracks:
-                                # Fallback SoundCloud
                                 tracks = await wavelink.Playable.search(f"scsearch:{query}")
                             if not tracks:
                                 extra = f"[não achou '{query}' em lugar nenhum. Zombe do gosto musical.]"
