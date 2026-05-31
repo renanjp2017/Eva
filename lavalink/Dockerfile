@@ -1,6 +1,12 @@
-FROM ghcr.io/lavalink-devs/lavalink:4.0.8
+FROM eclipse-temurin:17-jre-alpine
 
-# Copia o seu arquivo de configuração para dentro do servidor
-COPY application.yml /opt/Lavalink/application.yml
+WORKDIR /lavalink
 
-ENV _JAVA_OPTIONS="-Xmx1G"
+# Baixa o Lavalink jar
+ADD https://github.com/lavalink-devtools/youtube-source/releases/download/v1.11.3/Lavalink.jar Lavalink.jar
+
+COPY application.yml application.yml
+
+EXPOSE 2333
+
+ENTRYPOINT ["java", "-jar", "Lavalink.jar"]
