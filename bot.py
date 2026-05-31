@@ -385,7 +385,7 @@ async def gerar_resposta(user_id: str, query: str, contexto_extra: str = "") -> 
 
         r = await asyncio.to_thread(
             lambda: gemini_client.models.generate_content(
-                model="gemini-1.5-flash-8b",
+                model="gemini-1.5-flash",
                 contents=contents,
                 config=types.GenerateContentConfig(
                     system_instruction=system,
@@ -491,7 +491,7 @@ class Eva(discord.Client):
 
                     if action == "play":
                         try:
-                            tracks = await wavelink.Playable.search(f"ytsearch:{query}")
+                            tracks = await wavelink.Playable.search(f"ytmsearch:{query}")
                             if not tracks:
                                 tracks = await wavelink.Playable.search(f"scsearch:{query}")
                             if not tracks:
