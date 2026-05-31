@@ -4,3 +4,4 @@ openai==1.57.0
 python-dotenv==1.0.1
 requests==2.31.0
 asyncpg==0.29.0
+duckduckgo-search==8.1.1
