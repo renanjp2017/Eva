@@ -12,5 +12,5 @@ COPY application.yml application.yml
 
 EXPOSE 2333
 
-ENTRYPOINT ["java", "-jar", "Lavalink.jar"]
+ENTRYPOINT ["java", "-jar", "lavalink.jar"]
  
