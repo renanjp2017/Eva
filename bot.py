@@ -5,7 +5,6 @@ import os
 import json
 import re
 import asyncpg
-import base64
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
@@ -87,16 +86,19 @@ def _lista(val):
             return []
     return []
 
+async def get_usuario_conn(conn, user_id: str):
+    row = await conn.fetchrow("SELECT * FROM usuarios WHERE user_id = $1", user_id)
+    if not row:
+        await conn.execute(
+            "INSERT INTO usuarios (user_id) VALUES ($1) ON CONFLICT DO NOTHING",
+            user_id
+        )
+        row = await conn.fetchrow("SELECT * FROM usuarios WHERE user_id = $1", user_id)
+    return dict(row)
+
 async def get_usuario(user_id: str):
     async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT * FROM usuarios WHERE user_id = $1", user_id)
-        if not row:
-            await conn.execute(
-                "INSERT INTO usuarios (user_id) VALUES ($1) ON CONFLICT DO NOTHING",
-                user_id
-            )
-            row = await conn.fetchrow("SELECT * FROM usuarios WHERE user_id = $1", user_id)
-        return dict(row)
+        return await get_usuario_conn(conn, user_id)
 
 # ─────────────────────────────────────────
 #  RESUMO DE MEMÓRIA EM BACKGROUND
@@ -139,61 +141,67 @@ Histórico:
 #  ATUALIZAR USUÁRIO
 # ─────────────────────────────────────────
 async def atualizar_usuario(user_id: str, texto: str, resposta: str, display_name: str, channel_id: str):
-    u = await get_usuario(user_id)
-    fatos     = _lista(u["fatos"])
-    assuntos  = _lista(u["assuntos"])
-    historico = _lista(u["historico"])
-    nome = u["nome"] or display_name
-    aniversario = u.get("aniversario")
-
-    tl = texto.lower()
-
-    match_aniv = re.search(
-        r"(meu aniversário|meu aniver|faço anos|meu niver).{0,20}(dia\s*\d{1,2}|\d{1,2}[\/\-]\d{1,2})",
-        tl
-    )
-    if match_aniv:
-        aniversario = match_aniv.group(0)[:50]
-
-    gatilhos = [
-        "meu nome é", "eu tenho", "eu moro", "eu trabalho", "sou de",
-        "terminei", "fui demitido", "me formei", "tô namorando",
-        "fui demitida", "tô doente", "tô de ressaca", "perdi", "passei",
-        "consegui", "fui contratado", "me separei", "fui internado"
-    ]
-    for g in gatilhos:
-        if g in tl:
-            fato = texto[:120]
-            if fato not in fatos:
-                fatos.append(fato)
-                fatos = fatos[-20:]
-            break
-
-    temas = {
-        "música":         ["música", "banda", "show", "playlist", "álbum"],
-        "relacionamento": ["namorado", "namorada", "ex", "término", "ficante", "crush", "separei"],
-        "trabalho":       ["trabalho", "emprego", "chefe", "demiti", "salário", "contratado", "demitida"],
-        "saúde":          ["doente", "hospital", "remédio", "dor", "médico", "internado", "ressaca"],
-        "jogos":          ["jogo", "game", "partida", "ranked", "steam", "valorant", "lol"],
-        "faculdade":      ["faculdade", "prova", "aula", "nota", "professor"],
-    }
-    for tema, palavras in temas.items():
-        if any(p in tl for p in palavras):
-            if tema not in assuntos:
-                assuntos.append(tema)
-            break
-
-    historico.append(f"U:{texto}")
-    historico.append(f"E:{resposta}")
-
-    disparar_resumo = False
-    historico_para_resumir = []
-    if len(historico) >= 30:
-        disparar_resumo = True
-        historico_para_resumir = historico.copy()
-        historico = historico[-2:]
-
     async with db_pool.acquire() as conn:
+        u = await get_usuario_conn(conn, user_id)
+        fatos     = _lista(u["fatos"])
+        assuntos  = _lista(u["assuntos"])
+        historico = _lista(u["historico"])
+        nome = u["nome"] or display_name
+        aniversario = u.get("aniversario")
+
+        tl = texto.lower()
+
+        # Regex otimizada para capturar apenas a data e evitar lixo no banco
+        match_aniv = re.search(
+            r"(?:meu aniversário|meu aniver|faço anos|meu niver).{0,20}?(?:dia\s*)?(\d{1,2}[\/\-]\d{1,2}|\d{1,2})",
+            tl
+        )
+        if match_aniv:
+            data_crua = match_aniv.group(1)
+            # Se achou algo como "25/12" ou apenas o dia "25" (assume o mês atual se for só o dia)
+            if "/" in data_crua or "-" in data_crua:
+                aniversario = data_crua.replace("-", "/")
+            else:
+                aniversario = f"{data_crua}/{datetime.now(TZ).month}"
+
+        gatilhos = [
+            "meu nome é", "eu tenho", "eu moro", "eu trabalho", "sou de",
+            "terminei", "fui demitido", "me formei", "tô namorando",
+            "fui demitida", "tô doente", "tô de ressaca", "perdi", "passei",
+            "consegui", "fui contratado", "me separei", "fui internado"
+        ]
+        for g in gatilhos:
+            if g in tl:
+                fato = texto[:120]
+                if fato not in fatos:
+                    fatos.append(fato)
+                    fatos = fatos[-20:]
+                break
+
+        temas = {
+            "música":         ["música", "banda", "show", "playlist", "álbum"],
+            "relacionamento": ["namorado", "namorada", "ex", "término", "ficante", "crush", "separei"],
+            "trabalho":       ["trabalho", "emprego", "chefe", "demiti", "salário", "contratado", "demitida"],
+            "saúde":          ["doente", "hospital", "remédio", "dor", "médico", "internado", "ressaca"],
+            "jogos":          ["jogo", "game", "partida", "ranked", "steam", "valorant", "lol"],
+            "faculdade":      ["faculdade", "prova", "aula", "nota", "professor"],
+        }
+        for tema, palavras in temas.items():
+            if any(p in tl for p in palavras):
+                if tema not in assuntos:
+                    assuntos.append(tema)
+                break
+
+        historico.append(f"U:{texto}")
+        historico.append(f"E:{resposta}")
+
+        disparar_resumo = False
+        historico_para_resumir = []
+        if len(historico) >= 30:
+            disparar_resumo = True
+            historico_para_resumir = historico.copy()
+            historico = historico[-2:]
+
         await conn.execute("""
             UPDATE usuarios SET
                 nome             = $2,
@@ -215,7 +223,6 @@ async def atualizar_usuario(user_id: str, texto: str, resposta: str, display_nam
     if disparar_resumo:
         asyncio.create_task(sumarizar_historico_bg(user_id, historico_para_resumir))
 
-    # Registra interação do dia para o status
     interacoes_hoje[user_id] = display_name
 
 async def contexto_usuario(user_id: str):
@@ -243,14 +250,16 @@ async def contexto_usuario(user_id: str):
 # ─────────────────────────────────────────
 async def checar_aniversarios(client: discord.Client):
     hoje = datetime.now(TZ)
-    dia_mes = f"{hoje.day}/{hoje.month}"
+    dia_mes_1 = f"{hoje.day}/{hoje.month}"
+    dia_mes_2 = f"{hoje.day:02d}/{hoje.month:02d}"
+    
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT user_id, nome, aniversario, ultimo_canal FROM usuarios WHERE aniversario IS NOT NULL"
         )
     for row in rows:
-        aniv = row["aniversario"] or ""
-        if dia_mes not in aniv and f"{hoje.day:02d}/{hoje.month:02d}" not in aniv:
+        aniv = row["aniversario"].strip()
+        if aniv != dia_mes_1 and aniv != dia_mes_2:
             continue
         nome = row["nome"] or "essa pessoa"
         canal_id = row["ultimo_canal"]
@@ -298,10 +307,12 @@ TEMPLATES_STATUS = [
 ]
 
 async def atualizar_status(client: discord.Client):
-    """Roda diariamente. 5% de chance se houve interação no dia."""
-    if not interacoes_hoje:
-        return
-    if random.random() > 0.05:
+    """Muda ou remove o status baseado nas interações do dia."""
+    if not interacoes_hoje or random.random() > 0.05:
+        try:
+            await client.change_presence(activity=None)
+        except Exception:
+            pass
         return
 
     user_id, nome = random.choice(list(interacoes_hoje.items()))
@@ -309,15 +320,8 @@ async def atualizar_status(client: discord.Client):
     status_text = template.format(nome=nome)
 
     try:
-        await client.change_presence(
-            activity=discord.CustomActivity(name=status_text)
-        )
+        await client.change_presence(activity=discord.CustomActivity(name=status_text))
         print(f"[STATUS] Atualizado: {status_text}")
-
-        # Remove após 24h
-        await asyncio.sleep(86400)
-        await client.change_presence(activity=None)
-        print("[STATUS] Removido")
     except Exception as e:
         print(f"[STATUS ERR]: {e}")
 
@@ -328,8 +332,8 @@ async def scheduler_status(client: discord.Client):
         if agora >= proximo:
             proximo += timedelta(days=1)
         await asyncio.sleep((proximo - agora).total_seconds())
-        interacoes_hoje.clear()  # Reseta interações do dia depois de usar
         asyncio.create_task(atualizar_status(client))
+        interacoes_hoje.clear()  # Reseta de forma segura após o check do dia
 
 # ─────────────────────────────────────────
 #  MODERAÇÃO
@@ -344,10 +348,8 @@ XINGAMENTOS_PESADOS = [
 ]
 
 async def verificar_moderacao(message: discord.Message) -> bool:
-    """Retorna True se a mensagem foi deletada."""
     tl = message.content.lower()
 
-    # Só modera se for dirigido à Eva
     dirigido_eva = self_user_id is not None and (
         str(self_user_id) in message.content or
         re.search(r'\beva\b', tl)
@@ -358,7 +360,6 @@ async def verificar_moderacao(message: discord.Message) -> bool:
     user_id = str(message.author.id)
     agora = datetime.now(TZ).timestamp()
 
-    # Limpa ofensas antigas (última hora)
     if user_id not in historico_ofensas:
         historico_ofensas[user_id] = []
     historico_ofensas[user_id] = [t for t in historico_ofensas[user_id] if agora - t < 3600]
@@ -384,7 +385,6 @@ async def verificar_moderacao(message: discord.Message) -> bool:
         ]
         try:
             await message.delete()
-            humor = await descrever_humor_atual()
             just = random.choice(justificativas)
             await message.channel.send(
                 f"{message.author.mention} {just}",
@@ -397,7 +397,6 @@ async def verificar_moderacao(message: discord.Message) -> bool:
         except Exception as e:
             print(f"[MOD ERR]: {e}")
     elif tem_leve and frequencia == 1:
-        # Primeira ofensa leve — só responde com sarcasmo, não deleta
         respostas = [
             "interessante escolha de palavras.",
             "hm. tá bom.",
@@ -425,7 +424,7 @@ async def avaliar_imagem(image_bytes: bytes, mime_type: str, autor: str, context
 QUEM MANDOU: {autor}
 {f"O QUE VOCÊ SABE SOBRE ESSA PESSOA: {contexto_fatos}" if contexto_fatos else ""}
 
-Analise a imagem acima e reaja do seu jeito. Nunca elogie. Pode zoar o conteúdo, focar em algum detalhe bizarro, comentar o que achou com indiferença ou deboche. Se for comida, pode dizer que parece ração. Se for selfie, foque em algo estranho no fundo ou na expressão. Se for print de jogo, deboche do rank ou da jogada. Máximo 2 linhas."""
+Analise a imagem acima e reaja do seu jeito. Nunca elogie. Pode zoar o conteúdo, focar em algum detailhe bizarro, comentar o que achou com indiferença ou deboche. Se for comida, pode dizer que parece ração. Se for selfie, foque em algo estranho no fundo ou na expressão. Se for print de jogo, deboche do rank ou da jogada. Máximo 2 linhas."""
 
     for modelo in MODELOS_GEMINI:
         try:
@@ -448,7 +447,7 @@ Analise a imagem acima e reaja do seu jeito. Nunca elogie. Pode zoar o conteúdo
     return random.choice(["hm", "interessante.", "ok.", "..."])
 
 # ─────────────────────────────────────────
-#  GATILHOS ESPONTÂNEOS (20% de chance)
+#  GATILHOS ESPONTÂNEOS
 # ─────────────────────────────────────────
 GATILHOS_ESPONTANEOS = [
     (r"\bterminei\b|\bme separei\b|\bfui largad[oa]\b", "alguém acabou de terminar um relacionamento"),
@@ -796,7 +795,6 @@ class Eva(discord.Client):
         super().__init__(intents=intents)
 
     async def setup_hook(self):
-        global self_user_id
         await init_db()
         await inicializar_humor_diario()
         asyncio.create_task(scheduler_humor())
@@ -818,13 +816,11 @@ class Eva(discord.Client):
         mencionada  = self.user in message.mentions
         nome_citado = bool(re.search(r'\beva\b', tl))
 
-        # Moderação — verifica em todas as mensagens dirigidas à Eva
         if mencionada or nome_citado:
             deletada = await verificar_moderacao(message)
             if deletada:
                 return
 
-        # Visão — processa imagens quando Eva é mencionada
         if (mencionada or nome_citado) and message.attachments:
             for attachment in message.attachments:
                 if any(attachment.filename.lower().endswith(ext)
@@ -854,7 +850,6 @@ class Eva(discord.Client):
                         print(f"[VISÃO ERR]: {e}")
                     return
 
-        # Gatilhos espontâneos
         if not mencionada and not nome_citado:
             asyncio.create_task(verificar_gatilho_espontaneo(message))
             return
