@@ -162,8 +162,8 @@ async def get_usuario(user_id: str) -> dict:
             logger.warning(f"[REDIS GET ERR]: {e}")
 
     resumos_postgres = _lista(u.get("historico", "[]"))
-msgs_redis       = historico_recente
-u["historico_completo"] = resumos_postgres + msgs_redis
+    msgs_redis       = historico_recente
+    u["historico_completo"] = resumos_postgres + msgs_redis
     return u
 
 # ─────────────────────────────────────────
