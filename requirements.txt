@@ -6,3 +6,4 @@ requests==2.34.2
 asyncpg==0.31.0
 ddgs==9.14.4
 google-genai==2.7.0
+redis
