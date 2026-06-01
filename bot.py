@@ -25,9 +25,9 @@ groq_client   = OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/open
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 MODELOS_GEMINI = [
-    "gemini-3.5-flash",
-    "gemini-2.0-flash-lite",
-    "gemini-1.5-flash-8b",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash",
 ]
 
 TZ = ZoneInfo("America/Sao_Paulo")
