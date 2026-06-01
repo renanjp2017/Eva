@@ -5,6 +5,7 @@ import os
 import json
 import re
 import asyncpg
+import base64
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
@@ -32,8 +33,11 @@ MODELOS_GEMINI = [
 TZ = ZoneInfo("America/Sao_Paulo")
 db_pool: asyncpg.Pool = None
 
-# canal onde Eva vai mandar mensagens espontâneas (aniversário, etc)
-CANAL_GERAL_ID: int | None = None
+# Rastreia xingamentos por usuário: {user_id: [timestamps]}
+historico_ofensas: dict[str, list] = {}
+
+# Rastreia interações do dia: {user_id: display_name}
+interacoes_hoje: dict[str, str] = {}
 
 # ─────────────────────────────────────────
 #  BANCO DE DADOS
@@ -66,7 +70,6 @@ async def init_db():
                 micro_eventos   JSONB DEFAULT '[]'
             )
         """)
-        # Adiciona colunas novas se já existia a tabela
         for col, tipo in [("aniversario", "TEXT"), ("ultimo_canal", "TEXT")]:
             try:
                 await conn.execute(f"ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS {col} {tipo}")
@@ -145,7 +148,6 @@ async def atualizar_usuario(user_id: str, texto: str, resposta: str, display_nam
 
     tl = texto.lower()
 
-    # Detecta aniversário
     match_aniv = re.search(
         r"(meu aniversário|meu aniver|faço anos|meu niver).{0,20}(dia\s*\d{1,2}|\d{1,2}[\/\-]\d{1,2})",
         tl
@@ -153,7 +155,6 @@ async def atualizar_usuario(user_id: str, texto: str, resposta: str, display_nam
     if match_aniv:
         aniversario = match_aniv.group(0)[:50]
 
-    # Detecta fatos pessoais
     gatilhos = [
         "meu nome é", "eu tenho", "eu moro", "eu trabalho", "sou de",
         "terminei", "fui demitido", "me formei", "tô namorando",
@@ -205,15 +206,17 @@ async def atualizar_usuario(user_id: str, texto: str, resposta: str, display_nam
                 ultimo_canal     = $7
             WHERE user_id = $1
         """, user_id, nome,
-            json.dumps(fatos,    ensure_ascii=False),
-            json.dumps(assuntos, ensure_ascii=False),
-            json.dumps(historico,ensure_ascii=False),
-            aniversario,
-            channel_id
+            json.dumps(fatos,     ensure_ascii=False),
+            json.dumps(assuntos,  ensure_ascii=False),
+            json.dumps(historico, ensure_ascii=False),
+            aniversario, channel_id
         )
 
     if disparar_resumo:
         asyncio.create_task(sumarizar_historico_bg(user_id, historico_para_resumir))
+
+    # Registra interação do dia para o status
+    interacoes_hoje[user_id] = display_name
 
 async def contexto_usuario(user_id: str):
     u = await get_usuario(user_id)
@@ -239,37 +242,29 @@ async def contexto_usuario(user_id: str):
 #  ANIVERSÁRIOS
 # ─────────────────────────────────────────
 async def checar_aniversarios(client: discord.Client):
-    """Roda uma vez por dia e manda mensagem de aniversário no canal certo."""
     hoje = datetime.now(TZ)
     dia_mes = f"{hoje.day}/{hoje.month}"
-
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT user_id, nome, aniversario, ultimo_canal FROM usuarios WHERE aniversario IS NOT NULL"
         )
-
     for row in rows:
         aniv = row["aniversario"] or ""
-        # Verifica se o dia/mês aparece no texto guardado
         if dia_mes not in aniv and f"{hoje.day:02d}/{hoje.month:02d}" not in aniv:
             continue
-
         nome = row["nome"] or "essa pessoa"
         canal_id = row["ultimo_canal"]
         if not canal_id:
             continue
-
         canal = client.get_channel(int(canal_id))
         if not canal:
             continue
-
         humor = await descrever_humor_atual()
         prompt = f"""{PERSONALIDADE}
 
 {humor}
 
-Hoje é aniversário de {nome}. Mande uma mensagem no canal comentando isso do seu jeito — pode ser irônica, pode zoar, pode ser levemente calorosa mas nunca cafona. Varie. Pode comentar que ninguém lembrou, pode zoar o presente que vão dar, pode fingir que não liga mas mandar mesmo assim. Máximo 2 linhas."""
-
+Hoje é aniversário de {nome}. Mande uma mensagem comentando isso do seu jeito — irônica, zoando o presente que vão dar, comentando que ninguém lembrou, fingindo que não liga mas mandando mesmo assim. Varie. Máximo 2 linhas."""
         try:
             resposta = await gerar_resposta_raw(prompt)
             await canal.send(resposta)
@@ -287,45 +282,203 @@ async def scheduler_aniversarios(client: discord.Client):
         await checar_aniversarios(client)
 
 # ─────────────────────────────────────────
+#  STATUS DINÂMICO
+# ─────────────────────────────────────────
+TEMPLATES_STATUS = [
+    "Lendo as mensagens de {nome} e perdendo a fé na humanidade",
+    "Ignorando o {nome} com maestria",
+    "Ouvindo The Smiths e pensando no nada, diferente de {nome}",
+    "De ressaca emocional por causa do {nome}",
+    "{nome} falou comigo hoje. que dia.",
+    "Fingindo que {nome} não existe. tá funcionando",
+    "Alguém deveria avisar o {nome} que eu não ligo",
+    "Contando quantas vezes o {nome} me incomoda. perdi a conta",
+    "Meditando pra aguentar o {nome}",
+    "{nome} ainda existe. incrível.",
+]
+
+async def atualizar_status(client: discord.Client):
+    """Roda diariamente. 5% de chance se houve interação no dia."""
+    if not interacoes_hoje:
+        return
+    if random.random() > 0.05:
+        return
+
+    user_id, nome = random.choice(list(interacoes_hoje.items()))
+    template = random.choice(TEMPLATES_STATUS)
+    status_text = template.format(nome=nome)
+
+    try:
+        await client.change_presence(
+            activity=discord.CustomActivity(name=status_text)
+        )
+        print(f"[STATUS] Atualizado: {status_text}")
+
+        # Remove após 24h
+        await asyncio.sleep(86400)
+        await client.change_presence(activity=None)
+        print("[STATUS] Removido")
+    except Exception as e:
+        print(f"[STATUS ERR]: {e}")
+
+async def scheduler_status(client: discord.Client):
+    while True:
+        agora   = datetime.now(TZ)
+        proximo = agora.replace(hour=20, minute=0, second=0, microsecond=0)
+        if agora >= proximo:
+            proximo += timedelta(days=1)
+        await asyncio.sleep((proximo - agora).total_seconds())
+        interacoes_hoje.clear()  # Reseta interações do dia depois de usar
+        asyncio.create_task(atualizar_status(client))
+
+# ─────────────────────────────────────────
+#  MODERAÇÃO
+# ─────────────────────────────────────────
+XINGAMENTOS_LEVES = [
+    "idiota", "burro", "imbecil", "chato", "inútil", "ridículo",
+    "sem noção", "otário", "babaca"
+]
+XINGAMENTOS_PESADOS = [
+    "sua mãe", "vai se", "filho da", "filha da", "puta", "vadia",
+    "viado", "piranha", "desgraça", "inferno"
+]
+
+async def verificar_moderacao(message: discord.Message) -> bool:
+    """Retorna True se a mensagem foi deletada."""
+    tl = message.content.lower()
+
+    # Só modera se for dirigido à Eva
+    dirigido_eva = self_user_id is not None and (
+        str(self_user_id) in message.content or
+        re.search(r'\beva\b', tl)
+    )
+    if not dirigido_eva:
+        return False
+
+    user_id = str(message.author.id)
+    agora = datetime.now(TZ).timestamp()
+
+    # Limpa ofensas antigas (última hora)
+    if user_id not in historico_ofensas:
+        historico_ofensas[user_id] = []
+    historico_ofensas[user_id] = [t for t in historico_ofensas[user_id] if agora - t < 3600]
+
+    tem_pesado = any(x in tl for x in XINGAMENTOS_PESADOS)
+    tem_leve   = any(x in tl for x in XINGAMENTOS_LEVES)
+
+    if not tem_pesado and not tem_leve:
+        return False
+
+    historico_ofensas[user_id].append(agora)
+    frequencia = len(historico_ofensas[user_id])
+
+    deve_deletar = tem_pesado or frequencia >= 3
+
+    if deve_deletar:
+        justificativas = [
+            "Muita burrice acumulada, limpei pra o bem da saúde mental de todos.",
+            "Deletei. Minha timeline, minhas regras.",
+            "Isso aqui não é lixeira. Ah espera, era você.",
+            "Removido por excesso de mediocridade.",
+            "Essa mensagem não merecia existir. Igual a quem mandou, mas isso eu não consigo deletar.",
+        ]
+        try:
+            await message.delete()
+            humor = await descrever_humor_atual()
+            just = random.choice(justificativas)
+            await message.channel.send(
+                f"{message.author.mention} {just}",
+                delete_after=10
+            )
+            print(f"[MOD] Mensagem de {message.author} deletada.")
+            return True
+        except discord.Forbidden:
+            print("[MOD] Sem permissão pra deletar.")
+        except Exception as e:
+            print(f"[MOD ERR]: {e}")
+    elif tem_leve and frequencia == 1:
+        # Primeira ofensa leve — só responde com sarcasmo, não deleta
+        respostas = [
+            "interessante escolha de palavras.",
+            "hm. tá bom.",
+            "anotei. não mudou nd.",
+            "continua.",
+            "😐",
+        ]
+        try:
+            await message.reply(random.choice(respostas), mention_author=False)
+        except Exception:
+            pass
+
+    return False
+
+self_user_id: int | None = None
+
+# ─────────────────────────────────────────
+#  VISÃO DE IMAGENS
+# ─────────────────────────────────────────
+async def avaliar_imagem(image_bytes: bytes, mime_type: str, autor: str, contexto_fatos: str) -> str:
+    humor = await descrever_humor_atual()
+    prompt = f"""{PERSONALIDADE}
+
+{humor}
+QUEM MANDOU: {autor}
+{f"O QUE VOCÊ SABE SOBRE ESSA PESSOA: {contexto_fatos}" if contexto_fatos else ""}
+
+Analise a imagem acima e reaja do seu jeito. Nunca elogie. Pode zoar o conteúdo, focar em algum detalhe bizarro, comentar o que achou com indiferença ou deboche. Se for comida, pode dizer que parece ração. Se for selfie, foque em algo estranho no fundo ou na expressão. Se for print de jogo, deboche do rank ou da jogada. Máximo 2 linhas."""
+
+    for modelo in MODELOS_GEMINI:
+        try:
+            r = await asyncio.to_thread(
+                lambda m=modelo: gemini_client.models.generate_content(
+                    model=m,
+                    contents=[
+                        types.Content(parts=[
+                            types.Part(inline_data=types.Blob(mime_type=mime_type, data=image_bytes)),
+                            types.Part(text=prompt),
+                        ])
+                    ],
+                    config=types.GenerateContentConfig(max_output_tokens=120, temperature=0.95)
+                )
+            )
+            return r.text.strip()
+        except Exception as e:
+            print(f"[VISÃO ERR {modelo}]: {e}")
+            continue
+    return random.choice(["hm", "interessante.", "ok.", "..."])
+
+# ─────────────────────────────────────────
 #  GATILHOS ESPONTÂNEOS (20% de chance)
 # ─────────────────────────────────────────
 GATILHOS_ESPONTANEOS = [
-    # relacionamento
     (r"\bterminei\b|\bme separei\b|\bfui largad[oa]\b", "alguém acabou de terminar um relacionamento"),
-    (r"\btô apaixonad[oa]\b|\bstou apaixonad[oa]\b|\bto apaixonad[oa]\b", "alguém declarou que tá apaixonado"),
+    (r"\btô apaixonad[oa]\b|\bto apaixonad[oa]\b", "alguém declarou que tá apaixonado"),
     (r"\bficamos\b|\bfiquei com\b", "alguém ficou com alguém"),
-    # trabalho/vida
     (r"\bfui demitid[oa]\b|\bperdi o emprego\b|\bfui mandat[oa] embora\b", "alguém foi demitido"),
     (r"\bpassei na prova\b|\bpassei no vestibular\b|\bpassei na facul\b", "alguém passou em algo importante"),
     (r"\breprovei\b|\btombei\b|\blevei bomba\b", "alguém reprovou ou tombou em algo"),
     (r"\bme formei\b|\bformatura\b", "alguém se formou"),
-    # saúde/humor
     (r"\btô de ressaca\b|\bto de ressaca\b|\bressacad[oa]\b", "alguém tá de ressaca"),
     (r"\btô doente\b|\bto doente\b|\bfui ao médico\b|\bfui no médico\b", "alguém tá doente"),
     (r"\btô chorando\b|\bto chorando\b|\bchorei\b", "alguém tá chorando"),
-    # dinheiro
-    (r"\bfiquei sem grana\b|\bestou sem dinheiro\b|\btô broke\b|\btô liso\b|\bto liso\b", "alguém tá sem dinheiro"),
-    (r"\btomei no\b|\btomei uma\b|\bme roubaram\b", "alguém foi lesado ou tomou um golpe"),
-    # conquistas
+    (r"\bfiquei sem grana\b|\btô broke\b|\btô liso\b|\bto liso\b", "alguém tá sem dinheiro"),
+    (r"\btomei no\b|\bme roubaram\b", "alguém foi lesado ou tomou um golpe"),
     (r"\bcomprei\b.{0,20}\b(carro|moto|casa|apartamento|iphone|celular)\b", "alguém fez uma compra grande"),
     (r"\bfui promovid[oa]\b|\bganhei aumento\b", "alguém foi promovido"),
-    # social
-    (r"\bfui na festa\b|\btô na festa\b|\bto na festa\b|\bfui num show\b", "alguém foi numa festa ou show"),
+    (r"\bfui na festa\b|\btô na festa\b|\bfui num show\b", "alguém foi numa festa ou show"),
     (r"\bme chamaram de\b|\bme xingaram\b", "alguém foi chamado de algo ou xingado"),
-    (r"\btô com sono\b|\bto com sono\b|\bnão consigo dormir\b|\bnao consigo dormir\b", "alguém tá com sono ou insone"),
-    (r"\btô com fome\b|\bto com fome\b|\bestou morrendo de fome\b", "alguém tá com fome"),
+    (r"\btô com sono\b|\bnão consigo dormir\b|\bnao consigo dormir\b", "alguém tá com sono ou insone"),
+    (r"\btô com fome\b|\bto com fome\b|\bmorrendo de fome\b", "alguém tá com fome"),
     (r"\bperdi meu\b|\bperdi minha\b", "alguém perdeu algo"),
     (r"\bque tédio\b|\bque saudade\b|\bque raiva\b|\bque ódio\b", "alguém expressou uma emoção forte"),
 ]
 
-async def verificar_gatilho_espontaneo(message: discord.Message, client: discord.Client):
-    """Verifica gatilhos e responde com 20% de chance sem ser mencionada."""
+async def verificar_gatilho_espontaneo(message: discord.Message):
     tl = message.content.lower()
     for padrao, contexto in GATILHOS_ESPONTANEOS:
         if re.search(padrao, tl):
             if random.random() > 0.20:
                 return
-            # 30% de chance de só reagir com emoji em vez de texto
             if random.random() < 0.30:
                 emojis = ["💀", "😐", "🙂", "👁️", "😶", "🫠", "💅", "🤌", "😒", "👀"]
                 try:
@@ -333,7 +486,6 @@ async def verificar_gatilho_espontaneo(message: discord.Message, client: discord
                 except Exception:
                     pass
                 return
-
             humor = await descrever_humor_atual()
             nome = message.author.display_name
             prompt = f"""{PERSONALIDADE}
@@ -341,8 +493,7 @@ async def verificar_gatilho_espontaneo(message: discord.Message, client: discord
 {humor}
 
 Contexto: {contexto}. Quem disse isso foi {nome}.
-Reaja a isso do seu jeito — sem ser chamada, sem ser perguntada. Pode ignorar partes, pode zoar, pode ser indiferente. Máximo 1-2 linhas. Não comece com o nome da pessoa."""
-
+Reaja a isso do seu jeito sem ser chamada. Pode zoar, ser indiferente, provocar. Máximo 1-2 linhas. Não comece com o nome da pessoa."""
             try:
                 resposta = await gerar_resposta_raw(prompt)
                 await message.reply(resposta, mention_author=False)
@@ -547,14 +698,11 @@ def _montar_historico_gemini(historico: list) -> list:
     for linha in historico[-12:]:
         if linha.startswith("U:"):
             contents.append(types.Content(role="user",  parts=[types.Part(text=linha[2:])]))
-        elif linha.startswith("E:"):
-            contents.append(types.Content(role="model", parts=[types.Part(text=linha[2:])]))
-        elif linha.startswith("S:"):
+        elif linha.startswith(("E:", "S:")):
             contents.append(types.Content(role="model", parts=[types.Part(text=linha[2:])]))
     return contents
 
 async def gerar_resposta_raw(prompt: str) -> str:
-    """Gera resposta a partir de um prompt simples (sem histórico)."""
     for modelo in MODELOS_GEMINI:
         try:
             r = await asyncio.to_thread(
@@ -644,15 +792,20 @@ class Eva(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True
+        intents.members = True
         super().__init__(intents=intents)
 
     async def setup_hook(self):
+        global self_user_id
         await init_db()
         await inicializar_humor_diario()
         asyncio.create_task(scheduler_humor())
         asyncio.create_task(scheduler_aniversarios(self))
+        asyncio.create_task(scheduler_status(self))
 
     async def on_ready(self):
+        global self_user_id
+        self_user_id = self.user.id
         print(f"[EVA] Online: {self.user}")
 
     async def on_message(self, message: discord.Message):
@@ -665,14 +818,50 @@ class Eva(discord.Client):
         mencionada  = self.user in message.mentions
         nome_citado = bool(re.search(r'\beva\b', tl))
 
-        # Verifica gatilhos espontâneos em todas as mensagens
+        # Moderação — verifica em todas as mensagens dirigidas à Eva
+        if mencionada or nome_citado:
+            deletada = await verificar_moderacao(message)
+            if deletada:
+                return
+
+        # Visão — processa imagens quando Eva é mencionada
+        if (mencionada or nome_citado) and message.attachments:
+            for attachment in message.attachments:
+                if any(attachment.filename.lower().endswith(ext)
+                       for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]):
+                    try:
+                        image_bytes = await attachment.read()
+                        mime = "image/jpeg"
+                        if attachment.filename.lower().endswith(".png"):
+                            mime = "image/png"
+                        elif attachment.filename.lower().endswith(".gif"):
+                            mime = "image/gif"
+                        elif attachment.filename.lower().endswith(".webp"):
+                            mime = "image/webp"
+
+                        u = await get_usuario(str(message.author.id))
+                        fatos_str = " | ".join(_lista(u.get("fatos", []))[-3:])
+
+                        async with message.channel.typing():
+                            resposta = await avaliar_imagem(
+                                image_bytes, mime,
+                                message.author.display_name,
+                                fatos_str
+                            )
+                        await message.reply(resposta)
+                        interacoes_hoje[str(message.author.id)] = message.author.display_name
+                    except Exception as e:
+                        print(f"[VISÃO ERR]: {e}")
+                    return
+
+        # Gatilhos espontâneos
         if not mencionada and not nome_citado:
-            asyncio.create_task(verificar_gatilho_espontaneo(message, self))
+            asyncio.create_task(verificar_gatilho_espontaneo(message))
             return
 
-        user_id     = str(message.author.id)
-        display     = message.author.display_name
-        channel_id  = str(message.channel.id)
+        user_id    = str(message.author.id)
+        display    = message.author.display_name
+        channel_id = str(message.channel.id)
         texto_limpo = re.sub(r'<@!?\d+>', '', texto).strip()
 
         async with message.channel.typing():
