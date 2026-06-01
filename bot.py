@@ -16,7 +16,7 @@ from google.genai import types
 from collections import defaultdict, deque
 import logging
 import signal
-
+u["historico_completo"] = _lista(u.get("historico", "[]")) + historico_recente
 # ─────────────────────────────────────────
 #  LOGGING
 # ─────────────────────────────────────────
@@ -161,7 +161,9 @@ async def get_usuario(user_id: str) -> dict:
         except Exception as e:
             logger.warning(f"[REDIS GET ERR]: {e}")
 
-    u["historico_completo"] = _lista(u.get("historico", "[]")) + historico_recente
+    resumos_postgres = _lista(u.get("historico", "[]"))
+msgs_redis       = historico_recente
+u["historico_completo"] = resumos_postgres + msgs_redis
     return u
 
 # ─────────────────────────────────────────
@@ -213,38 +215,37 @@ async def atualizar_usuario(user_id: str, texto: str, resposta: str, display_nam
         logger.warning(f"[RATE LIMIT] {user_id} excedeu limite")
         return
 
-    chave  = f"eva:user:{user_id}:historico"
-    disparar_resumo    = False
-    historico_resumir  = []
+    chave = f"eva:user:{user_id}:historico"
+    disparar_resumo   = False
+    historico_resumir = []
 
     if redis_client:
         try:
-            pipe = redis_client.pipeline()
-            pipe.rpush(chave, f"U:{texto}", f"E:{resposta}")
+            # ✅ FIX: rpush fora do pipeline pra llen ler o tamanho correto
+            await redis_client.rpush(chave, f"U:{texto}", f"E:{resposta}")
             tamanho = await redis_client.llen(chave)
 
+            pipe = redis_client.pipeline()
             if tamanho >= 15:
                 disparar_resumo   = True
                 historico_resumir = await redis_client.lrange(chave, 0, -1)
                 pipe.ltrim(chave, -2, -1)
             else:
                 pipe.ltrim(chave, -15, -1)
-
             pipe.expire(chave, 86400)
             await pipe.execute()
         except Exception as e:
             logger.warning(f"[REDIS UPDATE ERR]: {e}")
 
     async with db_pool.acquire() as conn:
-        u          = await get_usuario_conn(conn, user_id)
-        fatos      = _lista(u["fatos"])
-        assuntos   = _lista(u["assuntos"])
-        nome       = u["nome"] or display_name
+        u           = await get_usuario_conn(conn, user_id)
+        fatos       = _lista(u["fatos"])
+        assuntos    = _lista(u["assuntos"])
+        nome        = u["nome"] or display_name
         aniversario = u.get("aniversario")
 
         tl = texto.lower()
 
-        # Detectar aniversário
         m = re.search(
             r"(?:meu aniversário|meu aniver|faço anos|meu niver).{0,20}?(?:dia\s*)?(\d{1,2}[\/\-]\d{1,2}|\d{1,2})",
             tl
@@ -253,7 +254,6 @@ async def atualizar_usuario(user_id: str, texto: str, resposta: str, display_nam
             raw = m.group(1)
             aniversario = raw.replace("-", "/") if ("/" in raw or "-" in raw) else f"{raw}/{datetime.now(TZ).month}"
 
-        # Detectar fatos pessoais
         gatilhos = [
             "meu nome é", "eu tenho", "eu moro", "eu trabalho", "sou de",
             "terminei", "fui demitido", "me formei", "tô namorando",
@@ -267,7 +267,6 @@ async def atualizar_usuario(user_id: str, texto: str, resposta: str, display_nam
                     fatos = (fatos + [fato])[-20:]
                 break
 
-        # Detectar temas
         temas = {
             "música":         ["música", "banda", "show", "playlist", "álbum"],
             "relacionamento": ["namorado", "namorada", "ex", "término", "ficante", "crush", "separei"],
