@@ -5,7 +5,6 @@ import os
 import json
 import re
 import asyncpg
-import base64
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
@@ -20,30 +19,21 @@ DISCORD_TOKEN  = os.getenv("DISCORD_TOKEN")
 GROQ_API_KEY   = os.getenv("GROQ_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DATABASE_URL   = os.getenv("DATABASE_URL")
-QWEN_API_KEY   = os.getenv("QWEN_API_KEY")
 
 groq_client   = OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Inicializa o Qwen usando a compatibilidade com a biblioteca OpenAI
-qwen_client = OpenAI(api_key=QWEN_API_KEY, base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
-MODELO_QWEN = "qwen-plus"
-
 MODELOS_GEMINI = [
     "gemini-3.5-flash",
     "gemini-2.0-flash-lite",
-    "gemini-1.5-flash",
+    "gemini-1.5-flash-8b",
 ]
-MODELO_VISAO = "gemini-2.0-flash-lite"
 
 TZ = ZoneInfo("America/Sao_Paulo")
 db_pool: asyncpg.Pool = None
 
-# Rastreia xingamentos por usuário: {user_id: [timestamp, ...]}
-_historico_xingamentos: dict[str, list] = {}
-
-# Rastreia quem interagiu hoje com a Eva: {user_id: display_name}
-_interacoes_hoje: dict[str, str] = {}
+# canal onde Eva vai mandar mensagens espontâneas (aniversário, etc)
+CANAL_GERAL_ID: int | None = None
 
 # ─────────────────────────────────────────
 #  BANCO DE DADOS
@@ -76,6 +66,7 @@ async def init_db():
                 micro_eventos   JSONB DEFAULT '[]'
             )
         """)
+        # Adiciona colunas novas se já existia a tabela
         for col, tipo in [("aniversario", "TEXT"), ("ultimo_canal", "TEXT")]:
             try:
                 await conn.execute(f"ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS {col} {tipo}")
@@ -105,7 +96,7 @@ async def get_usuario(user_id: str):
         return dict(row)
 
 # ─────────────────────────────────────────
-#  RESUMO DE MEMÓRIA
+#  RESUMO DE MEMÓRIA EM BACKGROUND
 # ─────────────────────────────────────────
 async def sumarizar_historico_bg(user_id: str, historico: list):
     texto_historico = "\n".join(historico)
@@ -133,7 +124,7 @@ Histórico:
                         "UPDATE usuarios SET historico = $1::jsonb WHERE user_id = $2",
                         json.dumps(novo_historico, ensure_ascii=False), user_id
                     )
-                print(f"[MEMÓRIA] {user_id} resumido!")
+                print(f"[MEMÓRIA] Histórico de {user_id} resumido!")
                 break
             except (asyncpg.exceptions.PostgresError, ConnectionResetError) as db_err:
                 print(f"[MEMÓRIA DB ERR] Tentativa {tentativa + 1}: {db_err}")
@@ -154,6 +145,7 @@ async def atualizar_usuario(user_id: str, texto: str, resposta: str, display_nam
 
     tl = texto.lower()
 
+    # Detecta aniversário
     match_aniv = re.search(
         r"(meu aniversário|meu aniver|faço anos|meu niver).{0,20}(dia\s*\d{1,2}|\d{1,2}[\/\-]\d{1,2})",
         tl
@@ -161,6 +153,7 @@ async def atualizar_usuario(user_id: str, texto: str, resposta: str, display_nam
     if match_aniv:
         aniversario = match_aniv.group(0)[:50]
 
+    # Detecta fatos pessoais
     gatilhos = [
         "meu nome é", "eu tenho", "eu moro", "eu trabalho", "sou de",
         "terminei", "fui demitido", "me formei", "tô namorando",
@@ -215,7 +208,8 @@ async def atualizar_usuario(user_id: str, texto: str, resposta: str, display_nam
             json.dumps(fatos,    ensure_ascii=False),
             json.dumps(assuntos, ensure_ascii=False),
             json.dumps(historico,ensure_ascii=False),
-            aniversario, channel_id
+            aniversario,
+            channel_id
         )
 
     if disparar_resumo:
@@ -245,32 +239,41 @@ async def contexto_usuario(user_id: str):
 #  ANIVERSÁRIOS
 # ─────────────────────────────────────────
 async def checar_aniversarios(client: discord.Client):
+    """Roda uma vez por dia e manda mensagem de aniversário no canal certo."""
     hoje = datetime.now(TZ)
     dia_mes = f"{hoje.day}/{hoje.month}"
+
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT user_id, nome, aniversario, ultimo_canal FROM usuarios WHERE aniversario IS NOT NULL"
         )
+
     for row in rows:
         aniv = row["aniversario"] or ""
+        # Verifica se o dia/mês aparece no texto guardado
         if dia_mes not in aniv and f"{hoje.day:02d}/{hoje.month:02d}" not in aniv:
             continue
+
         nome = row["nome"] or "essa pessoa"
         canal_id = row["ultimo_canal"]
         if not canal_id:
             continue
+
         canal = client.get_channel(int(canal_id))
         if not canal:
             continue
+
         humor = await descrever_humor_atual()
         prompt = f"""{PERSONALIDADE}
 
 {humor}
 
 Hoje é aniversário de {nome}. Mande uma mensagem no canal comentando isso do seu jeito — pode ser irônica, pode zoar, pode ser levemente calorosa mas nunca cafona. Varie. Pode comentar que ninguém lembrou, pode zoar o presente que vão dar, pode fingir que não liga mas mandar mesmo assim. Máximo 2 linhas."""
+
         try:
             resposta = await gerar_resposta_raw(prompt)
             await canal.send(resposta)
+            print(f"[ANIVERSÁRIO] Mensagem enviada pra {nome}")
         except Exception as e:
             print(f"[ANIVERSÁRIO ERR]: {e}")
 
@@ -284,194 +287,45 @@ async def scheduler_aniversarios(client: discord.Client):
         await checar_aniversarios(client)
 
 # ─────────────────────────────────────────
-#  STATUS DINÂMICO
-# ─────────────────────────────────────────
-async def atualizar_status(client: discord.Client):
-    if not _interacoes_hoje:
-        return
-    if random.random() > 0.05:
-        return
-
-    nome = random.choice(list(_interacoes_hoje.values()))
-    humor = await descrever_humor_atual()
-
-    prompt = f"""{PERSONALIDADE}
-
-{humor}
-
-Crie UMA frase curta (máximo 8 palavras) para o status do Discord da Eva envolvendo {nome}.
-Exemplos de tom: "Lendo as mensagens da Mel e perdendo a fé", "Ignorando o Matheus com sucesso", "De ressaca, culpa do Drops".
-Retorne APENAS a frase, sem aspas, sem explicação."""
-
-    try:
-        frase = await gerar_resposta_raw(prompt)
-        frase = frase.strip().strip('"').strip("'")[:128]
-        await client.change_presence(
-            activity=discord.CustomActivity(name=frase)
-        )
-        print(f"[STATUS] {frase}")
-        await asyncio.sleep(86400)
-        await client.change_presence(activity=None)
-    except Exception as e:
-        print(f"[STATUS ERR]: {e}")
-
-async def scheduler_status(client: discord.Client):
-    while True:
-        agora   = datetime.now(TZ)
-        proximo = agora.replace(hour=12, minute=0, second=0, microsecond=0)
-        if agora >= proximo:
-            proximo += timedelta(days=1)
-        await asyncio.sleep((proximo - agora).total_seconds())
-        await atualizar_status(client)
-        _interacoes_hoje.clear()
-
-# ─────────────────────────────────────────
-#  MODERAÇÃO INTELIGENTE
-# ─────────────────────────────────────────
-XINGAMENTOS_GRAVES = [
-    "sua mãe", "vai se foder", "vai tomar no", "filha da puta", "puta que pariu",
-    "vsf", "vtf", "fdp", "arrombad", "vá se foder", "vai pro inferno",
-]
-XINGAMENTOS_LEVES = [
-    "idiota", "burra", "inútil", "lixo", "merda", "otária", "estúpida",
-    "cala boca", "cale-se", "shut up", "cai fora",
-]
-
-def _nivel_xingamento(texto: str) -> int:
-    tl = texto.lower()
-    if any(x in tl for x in XINGAMENTOS_GRAVES):
-        return 2
-    if any(x in tl for x in XINGAMENTOS_LEVES):
-        return 1
-    return 0
-
-def _frequencia_xingamentos(user_id: str) -> int:
-    agora = datetime.now(TZ).timestamp()
-    historico = _historico_xingamentos.get(user_id, [])
-    recentes = [t for t in historico if agora - t < 600]
-    _historico_xingamentos[user_id] = recentes
-    return len(recentes)
-
-def _registrar_xingamento(user_id: str):
-    agora = datetime.now(TZ).timestamp()
-    if user_id not in _historico_xingamentos:
-        _historico_xingamentos[user_id] = []
-    _historico_xingamentos[user_id].append(agora)
-
-async def moderar_mensagem(message: discord.Message) -> bool:
-    nivel = _nivel_xingamento(message.content)
-    if nivel == 0:
-        return False
-
-    user_id = str(message.author.id)
-    _registrar_xingamento(user_id)
-    freq = _frequencia_xingamentos(user_id)
-
-    deve_deletar = nivel == 2 or (nivel == 1 and freq >= 3)
-
-    if deve_deletar:
-        try:
-            await message.delete()
-            justificativas = [
-                "Muita burrice acumulada, limpei pra saúde mental de todos.",
-                "Deletei. Minha linha do tempo, minhas regras.",
-                "Não, obrigada. Removido.",
-                "Isso não merecia existir. Resolvi.",
-                "Higiene básica do canal. De nada.",
-            ]
-            await message.channel.send(
-                f"{message.author.mention} — {random.choice(justificativas)}",
-                delete_after=8
-            )
-            return True
-        except discord.Forbidden:
-            pass
-    elif nivel == 1 and freq < 3:
-        respostas = [
-            "interessante vocabulário",
-            "muito maduro, parabéns",
-            "hm. que sofisticado",
-            "tá bom",
-            "anotei.",
-        ]
-        await message.reply(random.choice(respostas), mention_author=False)
-
-    return False
-
-# ─────────────────────────────────────────
-#  VISÃO DE IMAGENS
-# ─────────────────────────────────────────
-async def avaliar_imagem(message: discord.Message, attachment: discord.Attachment) -> str | None:
-    if not attachment.content_type or not attachment.content_type.startswith("image/"):
-        return None
-
-    try:
-        import aiohttp
-        async with aiohttp.ClientSession() as session:
-            async with session.get(attachment.url) as resp:
-                img_bytes = await resp.read()
-
-        img_b64 = base64.b64encode(img_bytes).decode("utf-8")
-        mime = attachment.content_type.split(";")[0]
-
-        humor = await descrever_humor_atual()
-        nome = message.author.display_name
-
-        prompt_text = f"""{PERSONALIDADE}
-
-{humor}
-
-{nome} mandou uma imagem no chat. Avalie ela do seu jeito — nunca elogie diretamente, seja sarcástica, debochada ou indiferente. Pode focar num detalhe bizarro, pode fingir que não quer ver, pode fazer uma observação cortante. Máximo 2 linhas."""
-
-        r = await asyncio.to_thread(
-            lambda: gemini_client.models.generate_content(
-                model=MODELO_VISAO,
-                contents=[
-                    types.Content(role="user", parts=[
-                        types.Part(inline_data=types.Blob(mime_type=mime, data=img_b64)),
-                        types.Part(text=prompt_text),
-                    ])
-                ],
-                config=types.GenerateContentConfig(max_output_tokens=100, temperature=0.95)
-            )
-        )
-        return r.text.strip()
-    except Exception as e:
-        print(f"[VISÃO ERR]: {e}")
-        return None
-
-# ─────────────────────────────────────────
-#  GATILHOS ESPONTÂNEOS
+#  GATILHOS ESPONTÂNEOS (20% de chance)
 # ─────────────────────────────────────────
 GATILHOS_ESPONTANEOS = [
+    # relacionamento
     (r"\bterminei\b|\bme separei\b|\bfui largad[oa]\b", "alguém acabou de terminar um relacionamento"),
-    (r"\btô apaixonad[oa]\b|\bto apaixonad[oa]\b", "alguém declarou que tá apaixonado"),
+    (r"\btô apaixonad[oa]\b|\bstou apaixonad[oa]\b|\bto apaixonad[oa]\b", "alguém declarou que tá apaixonado"),
     (r"\bficamos\b|\bfiquei com\b", "alguém ficou com alguém"),
-    (r"\bfui demitid[oa]\b|\bperdi o emprego\b", "alguém foi demitido"),
+    # trabalho/vida
+    (r"\bfui demitid[oa]\b|\bperdi o emprego\b|\bfui mandat[oa] embora\b", "alguém foi demitido"),
     (r"\bpassei na prova\b|\bpassei no vestibular\b|\bpassei na facul\b", "alguém passou em algo importante"),
     (r"\breprovei\b|\btombei\b|\blevei bomba\b", "alguém reprovou ou tombou em algo"),
     (r"\bme formei\b|\bformatura\b", "alguém se formou"),
+    # saúde/humor
     (r"\btô de ressaca\b|\bto de ressaca\b|\bressacad[oa]\b", "alguém tá de ressaca"),
-    (r"\btô doente\b|\bto doente\b|\bfui ao médico\b", "alguém tá doente"),
+    (r"\btô doente\b|\bto doente\b|\bfui ao médico\b|\bfui no médico\b", "alguém tá doente"),
     (r"\btô chorando\b|\bto chorando\b|\bchorei\b", "alguém tá chorando"),
-    (r"\bfiquei sem grana\b|\btô liso\b|\bto liso\b|\btô broke\b", "alguém tá sem dinheiro"),
-    (r"\btomei no\b|\bme roubaram\b", "alguém foi lesado ou tomou um golpe"),
+    # dinheiro
+    (r"\bfiquei sem grana\b|\bestou sem dinheiro\b|\btô broke\b|\btô liso\b|\bto liso\b", "alguém tá sem dinheiro"),
+    (r"\btomei no\b|\btomei uma\b|\bme roubaram\b", "alguém foi lesado ou tomou um golpe"),
+    # conquistas
     (r"\bcomprei\b.{0,20}\b(carro|moto|casa|apartamento|iphone|celular)\b", "alguém fez uma compra grande"),
     (r"\bfui promovid[oa]\b|\bganhei aumento\b", "alguém foi promovido"),
-    (r"\bfui na festa\b|\btô na festa\b|\bfui num show\b", "alguém foi numa festa ou show"),
+    # social
+    (r"\bfui na festa\b|\btô na festa\b|\bto na festa\b|\bfui num show\b", "alguém foi numa festa ou show"),
     (r"\bme chamaram de\b|\bme xingaram\b", "alguém foi chamado de algo ou xingado"),
-    (r"\btô com sono\b|\bnão consigo dormir\b|\bnao consigo dormir\b", "alguém tá com sono ou insone"),
-    (r"\btô com fome\b|\bto com fome\b|\bmorrendo de fome\b", "alguém tá com fome"),
+    (r"\btô com sono\b|\bto com sono\b|\bnão consigo dormir\b|\bnao consigo dormir\b", "alguém tá com sono ou insone"),
+    (r"\btô com fome\b|\bto com fome\b|\bestou morrendo de fome\b", "alguém tá com fome"),
     (r"\bperdi meu\b|\bperdi minha\b", "alguém perdeu algo"),
     (r"\bque tédio\b|\bque saudade\b|\bque raiva\b|\bque ódio\b", "alguém expressou uma emoção forte"),
 ]
 
-async def verificar_gatilho_espontaneo(message: discord.Message):
+async def verificar_gatilho_espontaneo(message: discord.Message, client: discord.Client):
+    """Verifica gatilhos e responde com 20% de chance sem ser mencionada."""
     tl = message.content.lower()
     for padrao, contexto in GATILHOS_ESPONTANEOS:
         if re.search(padrao, tl):
             if random.random() > 0.20:
                 return
+            # 30% de chance de só reagir com emoji em vez de texto
             if random.random() < 0.30:
                 emojis = ["💀", "😐", "🙂", "👁️", "😶", "🫠", "💅", "🤌", "😒", "👀"]
                 try:
@@ -479,6 +333,7 @@ async def verificar_gatilho_espontaneo(message: discord.Message):
                 except Exception:
                     pass
                 return
+
             humor = await descrever_humor_atual()
             nome = message.author.display_name
             prompt = f"""{PERSONALIDADE}
@@ -486,7 +341,8 @@ async def verificar_gatilho_espontaneo(message: discord.Message):
 {humor}
 
 Contexto: {contexto}. Quem disse isso foi {nome}.
-Reaja a isso do seu jeito — sem ser chamada. Pode zoar, pode ser indiferente. Máximo 1-2 linhas. Não comece com o nome da pessoa."""
+Reaja a isso do seu jeito — sem ser chamada, sem ser perguntada. Pode ignorar partes, pode zoar, pode ser indiferente. Máximo 1-2 linhas. Não comece com o nome da pessoa."""
+
             try:
                 resposta = await gerar_resposta_raw(prompt)
                 await message.reply(resposta, mention_author=False)
@@ -611,7 +467,7 @@ async def scheduler_humor():
         await inicializar_humor_diario()
 
 # ─────────────────────────────────────────
-#  ROTEADOR DE INTENÇÃO (Sempre via Groq)
+#  ROTEADOR DE INTENÇÃO
 # ─────────────────────────────────────────
 async def classificar_intencao(texto: str) -> dict:
     prompt = f"""Analise e retorne APENAS JSON válido, sem markdown.
@@ -620,11 +476,12 @@ Mensagem: "{texto}"
 Regras:
 - "intent": "search" se é pergunta factual, notícia, "quem é", "o que é", "quando foi"
 - "intent": "chat" para conversa normal
+- "action": "none"
 - "query": termo limpo
 
 Exemplos:
-{{"intent":"search","query":"quem ganhou a copa 2006"}}
-{{"intent":"chat","query":"{texto}"}}"""
+{{"intent":"search","action":"none","query":"quem ganhou a copa 2006"}}
+{{"intent":"chat","action":"none","query":"{texto}"}}"""
 
     try:
         r = await asyncio.to_thread(
@@ -639,7 +496,7 @@ Exemplos:
         return json.loads(r.choices[0].message.content)
     except Exception as e:
         print(f"[GROQ ROUTER ERR]: {e}")
-        return {"intent": "chat", "query": texto}
+        return {"intent": "chat", "action": "none", "query": texto}
 
 # ─────────────────────────────────────────
 #  BUSCA
@@ -683,32 +540,21 @@ O HUMOR DO DIA modifica COMO ela expressa esses traços — não quem ela é.
 Siga o humor descrito abaixo sem anunciá-lo. Seja orgânica."""
 
 # ─────────────────────────────────────────
-#  GERAÇÃO DE RESPOSTA (Cascata Qwen -> Gemini -> Groq)
+#  GERAÇÃO DE RESPOSTA
 # ─────────────────────────────────────────
 def _montar_historico_gemini(historico: list) -> list:
     contents = []
     for linha in historico[-12:]:
         if linha.startswith("U:"):
             contents.append(types.Content(role="user",  parts=[types.Part(text=linha[2:])]))
-        elif linha.startswith(("E:", "S:")):
+        elif linha.startswith("E:"):
+            contents.append(types.Content(role="model", parts=[types.Part(text=linha[2:])]))
+        elif linha.startswith("S:"):
             contents.append(types.Content(role="model", parts=[types.Part(text=linha[2:])]))
     return contents
 
 async def gerar_resposta_raw(prompt: str) -> str:
-    # 1. TENTA QWEN PRIMEIRO
-    try:
-        r = await asyncio.to_thread(
-            lambda: qwen_client.chat.completions.create(
-                model=MODELO_QWEN,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=120, temperature=0.95,
-            )
-        )
-        return r.choices[0].message.content.strip()
-    except Exception as e:
-        print(f"[QWEN ERR]: {e}")
-
-    # 2. TENTA GEMINI SE O QWEN FALHAR
+    """Gera resposta a partir de um prompt simples (sem histórico)."""
     for modelo in MODELOS_GEMINI:
         try:
             r = await asyncio.to_thread(
@@ -722,8 +568,6 @@ async def gerar_resposta_raw(prompt: str) -> str:
         except Exception as e:
             print(f"[GEMINI ERR {modelo}]: {e}")
             continue
-
-    # 3. TENTA GROQ SE TODOS FALHAREM
     try:
         r = await asyncio.to_thread(
             lambda: groq_client.chat.completions.create(
@@ -735,7 +579,6 @@ async def gerar_resposta_raw(prompt: str) -> str:
         return r.choices[0].message.content.strip()
     except Exception as e:
         print(f"[GROQ ERR]: {e}")
-        
     return random.choice(["hm", "q", "aff", "tá", "..."])
 
 async def gerar_resposta(user_id: str, query: str, contexto_extra: str = "") -> str:
@@ -749,31 +592,6 @@ async def gerar_resposta(user_id: str, query: str, contexto_extra: str = "") -> 
     u = await get_usuario(user_id)
     historico = _lista(u["historico"])
 
-    # Prepara mensagens formato OpenAI (usado por Qwen e Groq)
-    msgs = [{"role": "system", "content": system}]
-    for linha in historico[-12:]:
-        if linha.startswith("U:"):
-            msgs.append({"role": "user", "content": linha[2:]})
-        elif linha.startswith(("E:", "S:")):
-            msgs.append({"role": "assistant", "content": linha[2:]})
-    msgs.append({"role": "user", "content": query})
-
-    # 1. TENTA QWEN PRIMEIRO
-    try:
-        r = await asyncio.to_thread(
-            lambda: qwen_client.chat.completions.create(
-                model=MODELO_QWEN,
-                messages=msgs,
-                max_tokens=120,
-                temperature=0.92,
-            )
-        )
-        print("[QWEN] Sucesso")
-        return r.choices[0].message.content.strip()
-    except Exception as e:
-        print(f"[QWEN ERR]: {e}")
-
-    # 2. TENTA GEMINI SE O QWEN FALHAR
     contents = _montar_historico_gemini(historico)
     contents.append(types.Content(role="user", parts=[types.Part(text=query)]))
 
@@ -796,8 +614,14 @@ async def gerar_resposta(user_id: str, query: str, contexto_extra: str = "") -> 
             print(f"[GEMINI ERR {modelo}]: {e}")
             continue
 
-    # 3. TENTA GROQ SE TODOS FALHAREM
     try:
+        msgs = [{"role": "system", "content": system}]
+        for linha in historico[-12:]:
+            if linha.startswith("U:"):
+                msgs.append({"role": "user",      "content": linha[2:]})
+            elif linha.startswith(("E:", "S:")):
+                msgs.append({"role": "assistant", "content": linha[2:]})
+        msgs.append({"role": "user", "content": query})
         r = await asyncio.to_thread(
             lambda: groq_client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
@@ -820,7 +644,6 @@ class Eva(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True
-        intents.members = True
         super().__init__(intents=intents)
 
     async def setup_hook(self):
@@ -828,7 +651,6 @@ class Eva(discord.Client):
         await inicializar_humor_diario()
         asyncio.create_task(scheduler_humor())
         asyncio.create_task(scheduler_aniversarios(self))
-        asyncio.create_task(scheduler_status(self))
 
     async def on_ready(self):
         print(f"[EVA] Online: {self.user}")
@@ -843,27 +665,10 @@ class Eva(discord.Client):
         mencionada  = self.user in message.mentions
         nome_citado = bool(re.search(r'\beva\b', tl))
 
-        # Moderação — roda em todas as mensagens que mencionem ela
-        if mencionada or nome_citado:
-            deletado = await moderar_mensagem(message)
-            if deletado:
-                return
-
-        # Visão — imagem enviada e Eva mencionada
-        if (mencionada or nome_citado) and message.attachments:
-            for att in message.attachments:
-                resposta_imagem = await avaliar_imagem(message, att)
-                if resposta_imagem:
-                    await message.reply(resposta_imagem)
-                    return
-
-        # Gatilhos espontâneos em mensagens sem menção
+        # Verifica gatilhos espontâneos em todas as mensagens
         if not mencionada and not nome_citado:
-            asyncio.create_task(verificar_gatilho_espontaneo(message))
+            asyncio.create_task(verificar_gatilho_espontaneo(message, self))
             return
-
-        # Registra interação do dia pra status
-        _interacoes_hoje[str(message.author.id)] = message.author.display_name
 
         user_id     = str(message.author.id)
         display     = message.author.display_name
