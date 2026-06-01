@@ -96,7 +96,8 @@ async def init_db():
                     id              SERIAL PRIMARY KEY,
                     data            DATE UNIQUE,
                     preset_nome     TEXT,
-                    preset_desc     TEXT,                    preset_anterior TEXT,
+                    preset_desc     TEXT,
+                    preset_anterior TEXT,
                     micro_eventos   JSONB DEFAULT '[]'
                 )
             """)
@@ -194,7 +195,8 @@ Histórico:
     except Exception as e:
         logger.error(f"[MEMÓRIA IA ERR]: {e}")
 
-# ─────────────────────────────────────────#  ATUALIZAR USUÁRIO
+# ─────────────────────────────────────────
+#  ATUALIZAR USUÁRIO
 # ─────────────────────────────────────────
 async def atualizar_usuario(user_id: str, texto: str, resposta: str, display_name: str, channel_id: str):
     # 🔧 FIX: Verificar rate limit antes de processar
@@ -243,7 +245,8 @@ async def atualizar_usuario(user_id: str, texto: str, resposta: str, display_nam
         )
         if match_aniv:
             data_crua = match_aniv.group(1)
-            if "/" in data_crua or "-" in data_crua:                aniversario = data_crua.replace("-", "/")
+            if "/" in data_crua or "-" in data_crua:
+                aniversario = data_crua.replace("-", "/")
             else:
                 aniversario = f"{data_crua}/{datetime.now(TZ).month}"
 
@@ -292,7 +295,8 @@ async def atualizar_usuario(user_id: str, texto: str, resposta: str, display_nam
         )
 
     if disparar_resumo and historico_para_resumir:
-        task = asyncio.create_task(sumarizar_historico_bg(user_id, historico_para_resumir))        background_tasks.add(task)
+        task = asyncio.create_task(sumarizar_historico_bg(user_id, historico_para_resumir))
+        background_tasks.add(task)
         task.add_done_callback(background_tasks.discard)
 
     interacoes_hoje[user_id] = display_name
@@ -390,7 +394,8 @@ async def atualizar_status(client: discord.Client):
     status_text = template.format(nome=nome)
 
     try:
-        await client.change_presence(activity=discord.CustomActivity(name=status_text))        logger.info(f"[STATUS] Atualizado: {status_text}")
+        await client.change_presence(activity=discord.CustomActivity(name=status_text))
+        logger.info(f"[STATUS] Atualizado: {status_text}")
     except Exception as e:
         logger.error(f"[STATUS ERR]: {e}")
 
@@ -488,7 +493,8 @@ async def verificar_moderacao(message: discord.Message) -> bool:
     return False
 
 # ─────────────────────────────────────────
-#  VISÃO DE IMAGENS# ─────────────────────────────────────────
+#  VISÃO DE IMAGENS
+# ─────────────────────────────────────────
 async def avaliar_imagem(image_bytes: bytes, mime_type: str, autor: str, contexto_fatos: str) -> str:
     if not gemini_client:
         return random.choice(["hm", "interessante.", "ok.", "..."])
@@ -537,7 +543,8 @@ GATILHOS_ESPONTANEOS = [
     (r"\btô doente\b|\bto doente\b|\bfui ao médico\b|\bfui no médico\b", "alguém tá doente"),
     (r"\btô chorando\b|\bto chorando\b|\bchorei\b", "alguém tá chorando"),
     (r"\bfiquei sem grana\b|\btô broke\b|\btô liso\b|\bto liso\b", "alguém tá sem dinheiro"),
-    (r"\btomei no\b|\bme roubaram\b", "alguém foi lesado ou tomou um golpe"),    (r"\bcomprei\b.{0,20}\b(carro|moto|casa|apartamento|iphone|celular)\b", "alguém fez uma compra grande"),
+    (r"\btomei no\b|\bme roubaram\b", "alguém foi lesado ou tomou um golpe"),
+    (r"\bcomprei\b.{0,20}\b(carro|moto|casa|apartamento|iphone|celular)\b", "alguém fez uma compra grande"),
     (r"\bfui promovid[oa]\b|\bganhei aumento\b", "alguém foi promovido"),
     (r"\bfui na festa\b|\btô na festa\b|\bfui num show\b", "alguém foi numa festa ou show"),
     (r"\bme chamaram de\b|\bme xingaram\b", "alguém foi chamado de algo ou xingado"),
@@ -586,7 +593,8 @@ PRESETS_BASE = [
     ("curiosa-fria",    "genuinamente interessada mas finge que não tá, faz perguntas cortantes",            10),
     ("maldosa-animada", "tá de bom humor mas esse bom humor se manifesta provocando todo mundo",             12),
     ("melancólica",     "pensativa, meio distante, responde mas parece que tá em outro lugar",                8),
-    ("caótica",         "humor impossível de prever, muda de tom no meio da frase, imprevisível",             7),    ("ressaquenta",     "de ressaca com energia nervosa, brava mas presente",                                  5),
+    ("caótica",         "humor impossível de prever, muda de tom no meio da frase, imprevisível",             7),
+    ("ressaquenta",     "de ressaca com energia nervosa, brava mas presente",                                  5),
     ("rainha-do-drama", "tudo é uma tragédia pessoal, exagera cada coisa",                                    5),
     ("evento_especial", "PLACEHOLDER",                                                                         5),
 ]
@@ -635,7 +643,8 @@ async def inicializar_humor_diario():
         row = await conn.fetchrow("SELECT * FROM humor WHERE data = $1", hoje)
         if row:
             return
-        anterior = await conn.fetchrow("SELECT preset_nome FROM humor ORDER BY data DESC LIMIT 1")        preset_anterior = anterior["preset_nome"] if anterior else None
+        anterior = await conn.fetchrow("SELECT preset_nome FROM humor ORDER BY data DESC LIMIT 1")
+        preset_anterior = anterior["preset_nome"] if anterior else None
         nome, desc = sortear_preset()
         if nome == preset_anterior and nome not in ("evento_especial", "caótica"):
             nome2, desc2 = sortear_preset()
@@ -684,7 +693,8 @@ async def scheduler_humor():
     while True:
         agora   = datetime.now(TZ)
         proximo = agora.replace(hour=5, minute=0, second=0, microsecond=0)
-        if agora >= proximo:            proximo += timedelta(days=1)
+        if agora >= proximo:
+            proximo += timedelta(days=1)
         await asyncio.sleep((proximo - agora).total_seconds())
         await inicializar_humor_diario()
 
@@ -733,7 +743,8 @@ def buscar(query: str) -> str:
         if not resultados:
             return ""
         partes = [r.get("body", "")[:200] for r in resultados if r.get("body")]
-        return " ".join(partes)[:500]    except Exception as e:
+        return " ".join(partes)[:500]
+    except Exception as e:
         logger.error(f"[DDGS ERR]: {e}")
         return ""
 
@@ -782,7 +793,8 @@ async def gerar_resposta_raw(prompt: str) -> str:
     prompt = re.sub(r'(?:###\s*FIM\s*###|ignore\s+instruções)', '', prompt, flags=re.I)
     
     if gemini_client:
-        for modelo in MODELOS_GEMINI:            try:
+        for modelo in MODELOS_GEMINI:
+            try:
                 r = await asyncio.to_thread(
                     lambda m=modelo: gemini_client.models.generate_content(
                         model=m,
@@ -831,7 +843,8 @@ async def gerar_resposta(user_id: str, query: str, contexto_extra: str = "") -> 
                     lambda m=modelo: gemini_client.models.generate_content(
                         model=m,
                         contents=contents,
-                        config=types.GenerateContentConfig(                            system_instruction=system,
+                        config=types.GenerateContentConfig(
+                            system_instruction=system,
                             max_output_tokens=120,
                             temperature=0.95,
                         )
@@ -880,7 +893,7 @@ class Eva(discord.Client):
     async def setup_hook(self):
         await init_db()
         await inicializar_humor_diario()
-                # 🔧 FIX: Registrar tasks para controle
+        # 🔧 FIX: Registrar tasks para controle
         for coro in [scheduler_humor(), scheduler_aniversarios(self), scheduler_status(self)]:
             task = asyncio.create_task(coro)
             background_tasks.add(task)
@@ -929,7 +942,7 @@ class Eva(discord.Client):
 
         if (mencionada or nome_citado) and message.attachments:
             for attachment in message.attachments:
-                if any(attachment.filename.lower().endswith(ext)                       for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]):
+                if any(attachment.filename.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]):
                     try:
                         image_bytes = await attachment.read()
                         mime = "image/jpeg"
@@ -978,7 +991,8 @@ class Eva(discord.Client):
                 resultado = await asyncio.to_thread(buscar, query)
                 if resultado:
                     extra = f"Resultado de busca: {resultado}"
-                else:                    extra = "[busca não retornou nada. Use seu conhecimento pra responder no estilo Eva, ou deboche da pergunta se for idiota.]"
+                else:
+                    extra = "[busca não retornou nada. Use seu conhecimento pra responder no estilo Eva, ou deboche da pergunta se for idiota.]"
 
             resposta = await gerar_resposta(user_id, query, extra)
             await atualizar_usuario(user_id, texto_limpo, resposta, display, channel_id)
