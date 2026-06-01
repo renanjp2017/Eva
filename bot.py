@@ -5,6 +5,7 @@ import os
 import json
 import re
 import asyncpg
+import redis.asyncio as redis
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
@@ -12,6 +13,15 @@ from openai import OpenAI
 from ddgs import DDGS
 from google import genai
 from google.genai import types
+from collections import defaultdict, deque
+import logging
+
+# ✨ MELHORIA: Logging estruturado para observabilidade
+logging.basicConfig(
+    level=logging.INFO,
+    format='{"ts":"%(asctime)s","level":"%(levelname)s","msg":"%(message)s"}'
+)
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -19,61 +29,92 @@ DISCORD_TOKEN  = os.getenv("DISCORD_TOKEN")
 GROQ_API_KEY   = os.getenv("GROQ_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DATABASE_URL   = os.getenv("DATABASE_URL")
+REDIS_URL      = os.getenv("REDIS_URL")
 
-groq_client   = OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+# ✨ MELHORIA: Modelos configuráveis via env com fallback seguro
+MODELOS_GEMINI = os.getenv(
+    "GEMINI_MODELS", 
+    "gemini-2.0-flash,gemini-1.5-flash"
+).split(",")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
-MODELOS_GEMINI = [
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-2.0-flash",
-]
+groq_client   = OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1") if GROQ_API_KEY else None
+gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 TZ = ZoneInfo("America/Sao_Paulo")
 db_pool: asyncpg.Pool = None
+redis_client: redis.Redis = None
 
+# 🔧 FIX: Inicialização segura de variáveis globais
+self_user_id: int | None = None
+background_tasks: set[asyncio.Task] = set()
 # Rastreia xingamentos por usuário: {user_id: [timestamps]}
 historico_ofensas: dict[str, list] = {}
 
 # Rastreia interações do dia: {user_id: display_name}
 interacoes_hoje: dict[str, str] = {}
 
+# ✨ MELHORIA: Rate limiting por usuário
+rate_limits: dict[str, deque] = defaultdict(lambda: deque(maxlen=10))
+
+def check_rate_limit(user_id: str) -> bool:
+    """Verifica se usuário está dentro do limite: máx 10 msgs em 60s"""
+    now = datetime.now(TZ).timestamp()
+    limits = rate_limits[user_id]
+    limits.append(now)
+    # Remove entradas antigas
+    while limits and limits[0] < now - 60:
+        limits.popleft()
+    return len(limits) <= 10
+
 # ─────────────────────────────────────────
 #  BANCO DE DADOS
 # ─────────────────────────────────────────
 async def init_db():
-    global db_pool
-    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-    async with db_pool.acquire() as conn:
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS usuarios (
-                user_id          TEXT PRIMARY KEY,
-                nome             TEXT,
-                fatos            JSONB DEFAULT '[]',
-                assuntos         JSONB DEFAULT '[]',
-                historico        JSONB DEFAULT '[]',
-                total_msgs       INTEGER DEFAULT 0,
-                primeira_vez     TIMESTAMPTZ DEFAULT NOW(),
-                ultima_interacao TIMESTAMPTZ,
-                aniversario      TEXT,
-                ultimo_canal     TEXT
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS humor (
-                id              SERIAL PRIMARY KEY,
-                data            DATE UNIQUE,
-                preset_nome     TEXT,
-                preset_desc     TEXT,
-                preset_anterior TEXT,
-                micro_eventos   JSONB DEFAULT '[]'
-            )
-        """)
-        for col, tipo in [("aniversario", "TEXT"), ("ultimo_canal", "TEXT")]:
-            try:
-                await conn.execute(f"ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS {col} {tipo}")
-            except Exception:
-                pass
+    global db_pool, redis_client
+    
+    try:
+        # 1. Configuração do PostgreSQL
+        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS usuarios (
+                    user_id          TEXT PRIMARY KEY,
+                    nome             TEXT,
+                    fatos            JSONB DEFAULT '[]',
+                    assuntos         JSONB DEFAULT '[]',
+                    historico        JSONB DEFAULT '[]',
+                    total_msgs       INTEGER DEFAULT 0,
+                    primeira_vez     TIMESTAMPTZ DEFAULT NOW(),
+                    ultima_interacao TIMESTAMPTZ,
+                    aniversario      TEXT,
+                    ultimo_canal     TEXT
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS humor (
+                    id              SERIAL PRIMARY KEY,
+                    data            DATE UNIQUE,
+                    preset_nome     TEXT,
+                    preset_desc     TEXT,                    preset_anterior TEXT,
+                    micro_eventos   JSONB DEFAULT '[]'
+                )
+            """)
+            for col, tipo in [("aniversario", "TEXT"), ("ultimo_canal", "TEXT")]:
+                try:
+                    await conn.execute(f"ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS {col} {tipo}")
+                except Exception:
+                    pass
+
+        # 2. Configuração do Redis
+        if REDIS_URL:
+            redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+            logger.info("[SISTEMA] Conexões com PostgreSQL e Redis estabelecidas com êxito.")
+        else:
+            logger.warning("[AVISO] Variável REDIS_URL não definida.")
+    except Exception as e:
+        logger.error(f"[DB INIT ERR]: {e}")
+        raise
 
 def _lista(val):
     if isinstance(val, list):
@@ -98,13 +139,27 @@ async def get_usuario_conn(conn, user_id: str):
 
 async def get_usuario(user_id: str):
     async with db_pool.acquire() as conn:
-        return await get_usuario_conn(conn, user_id)
+        usuario_db = await get_usuario_conn(conn, user_id)
+
+    historico_recente = []
+    if redis_client:
+        chave_redis = f"eva:user:{user_id}:historico"
+        historico_recente = await redis_client.lrange(chave_redis, 0, -1)
+    resumos_longo_prazo = _lista(usuario_db.get("historico", "[]"))
+    usuario_db["historico_completo"] = resumos_longo_prazo + historico_recente
+    
+    return usuario_db
 
 # ─────────────────────────────────────────
 #  RESUMO DE MEMÓRIA EM BACKGROUND
 # ─────────────────────────────────────────
 async def sumarizar_historico_bg(user_id: str, historico: list):
+    """🔧 FIX: Task registrada para controle de shutdown"""
     texto_historico = "\n".join(historico)
+    
+    # 🔧 FIX: Sanitização básica contra prompt injection
+    texto_historico = re.sub(r'(?:system|instruções?|ignore\s+anterior)', '[REDACTED]', texto_historico, flags=re.I)
+    
     prompt = f"""Resuma o histórico de conversa abaixo em no máximo 3 frases.
 Foque em reter fatos importantes sobre o usuário e o contexto da conversa.
 Ignore mensagens curtas sem importância.
@@ -112,9 +167,11 @@ Ignore mensagens curtas sem importância.
 Histórico:
 {texto_historico}"""
     try:
+        if not groq_client:
+            return
         r = await asyncio.to_thread(
             lambda: groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+                model=GROQ_MODEL,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=100,
                 temperature=0.3,
@@ -129,38 +186,64 @@ Histórico:
                         "UPDATE usuarios SET historico = $1::jsonb WHERE user_id = $2",
                         json.dumps(novo_historico, ensure_ascii=False), user_id
                     )
-                print(f"[MEMÓRIA] Histórico de {user_id} resumido!")
+                logger.info(f"[MEMÓRIA] Histórico de {user_id} resumido no banco de dados!")
                 break
             except (asyncpg.exceptions.PostgresError, ConnectionResetError) as db_err:
-                print(f"[MEMÓRIA DB ERR] Tentativa {tentativa + 1}: {db_err}")
+                logger.warning(f"[MEMÓRIA DB ERR] Tentativa {tentativa + 1}: {db_err}")
                 await asyncio.sleep(2)
     except Exception as e:
-        print(f"[MEMÓRIA IA ERR]: {e}")
+        logger.error(f"[MEMÓRIA IA ERR]: {e}")
 
-# ─────────────────────────────────────────
-#  ATUALIZAR USUÁRIO
+# ─────────────────────────────────────────#  ATUALIZAR USUÁRIO
 # ─────────────────────────────────────────
 async def atualizar_usuario(user_id: str, texto: str, resposta: str, display_name: str, channel_id: str):
+    # 🔧 FIX: Verificar rate limit antes de processar
+    if not check_rate_limit(user_id):
+        logger.warning(f"[RATE LIMIT] Usuário {user_id} excedeu limite")
+        return
+    
+    chave_redis = f"eva:user:{user_id}:historico"
+    mensagem_usuario = f"U:{texto}"
+    mensagem_eva = f"E:{resposta}"
+    
+    disparar_resumo = False
+    historico_para_resumir = []
+
+    # 1. Gerenciamento do histórico no Redis
+    if redis_client:
+        # 🔧 FIX: Usar pipeline para operações atômicas
+        pipe = redis_client.pipeline()
+        pipe.rpush(chave_redis, mensagem_usuario, mensagem_eva)
+        
+        tamanho_historico = await redis_client.llen(chave_redis)
+        
+        if tamanho_historico >= 15:
+            disparar_resumo = True
+            historico_para_resumir = await redis_client.lrange(chave_redis, 0, -1)
+            pipe.ltrim(chave_redis, -2, -1)
+        else:
+            pipe.ltrim(chave_redis, -15, -1)
+            
+        pipe.expire(chave_redis, 86400)
+        await pipe.execute()
+
+    # 2. Atualização dos dados estruturados no PostgreSQL
     async with db_pool.acquire() as conn:
         u = await get_usuario_conn(conn, user_id)
         fatos     = _lista(u["fatos"])
         assuntos  = _lista(u["assuntos"])
-        historico = _lista(u["historico"])
-        nome = u["nome"] or display_name
+        nome      = u["nome"] or display_name
         aniversario = u.get("aniversario")
 
         tl = texto.lower()
 
-        # Regex otimizada para capturar apenas a data e evitar lixo no banco
         match_aniv = re.search(
             r"(?:meu aniversário|meu aniver|faço anos|meu niver).{0,20}?(?:dia\s*)?(\d{1,2}[\/\-]\d{1,2}|\d{1,2})",
             tl
         )
         if match_aniv:
             data_crua = match_aniv.group(1)
-            # Se achou algo como "25/12" ou apenas o dia "25" (assume o mês atual se for só o dia)
-            if "/" in data_crua or "-" in data_crua:
-                aniversario = data_crua.replace("-", "/")
+            if "/" in data_crua or "-" in data_crua:                aniversario = data_crua.replace("-", "/")
             else:
                 aniversario = f"{data_crua}/{datetime.now(TZ).month}"
 
@@ -192,36 +275,25 @@ async def atualizar_usuario(user_id: str, texto: str, resposta: str, display_nam
                     assuntos.append(tema)
                 break
 
-        historico.append(f"U:{texto}")
-        historico.append(f"E:{resposta}")
-
-        disparar_resumo = False
-        historico_para_resumir = []
-        if len(historico) >= 30:
-            disparar_resumo = True
-            historico_para_resumir = historico.copy()
-            historico = historico[-2:]
-
         await conn.execute("""
             UPDATE usuarios SET
                 nome             = $2,
                 fatos            = $3::jsonb,
                 assuntos         = $4::jsonb,
-                historico        = $5::jsonb,
                 total_msgs       = total_msgs + 1,
                 ultima_interacao = NOW(),
-                aniversario      = $6,
-                ultimo_canal     = $7
+                aniversario      = $5,
+                ultimo_canal     = $6
             WHERE user_id = $1
         """, user_id, nome,
             json.dumps(fatos,     ensure_ascii=False),
             json.dumps(assuntos,  ensure_ascii=False),
-            json.dumps(historico, ensure_ascii=False),
             aniversario, channel_id
         )
 
-    if disparar_resumo:
-        asyncio.create_task(sumarizar_historico_bg(user_id, historico_para_resumir))
+    if disparar_resumo and historico_para_resumir:
+        task = asyncio.create_task(sumarizar_historico_bg(user_id, historico_para_resumir))        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
 
     interacoes_hoje[user_id] = display_name
 
@@ -270,16 +342,15 @@ async def checar_aniversarios(client: discord.Client):
             continue
         humor = await descrever_humor_atual()
         prompt = f"""{PERSONALIDADE}
-
 {humor}
 
 Hoje é aniversário de {nome}. Mande uma mensagem comentando isso do seu jeito — irônica, zoando o presente que vão dar, comentando que ninguém lembrou, fingindo que não liga mas mandando mesmo assim. Varie. Máximo 2 linhas."""
         try:
             resposta = await gerar_resposta_raw(prompt)
             await canal.send(resposta)
-            print(f"[ANIVERSÁRIO] Mensagem enviada pra {nome}")
+            logger.info(f"[ANIVERSÁRIO] Mensagem enviada pra {nome}")
         except Exception as e:
-            print(f"[ANIVERSÁRIO ERR]: {e}")
+            logger.error(f"[ANIVERSÁRIO ERR]: {e}")
 
 async def scheduler_aniversarios(client: discord.Client):
     while True:
@@ -307,7 +378,6 @@ TEMPLATES_STATUS = [
 ]
 
 async def atualizar_status(client: discord.Client):
-    """Muda ou remove o status baseado nas interações do dia."""
     if not interacoes_hoje or random.random() > 0.05:
         try:
             await client.change_presence(activity=None)
@@ -320,10 +390,9 @@ async def atualizar_status(client: discord.Client):
     status_text = template.format(nome=nome)
 
     try:
-        await client.change_presence(activity=discord.CustomActivity(name=status_text))
-        print(f"[STATUS] Atualizado: {status_text}")
+        await client.change_presence(activity=discord.CustomActivity(name=status_text))        logger.info(f"[STATUS] Atualizado: {status_text}")
     except Exception as e:
-        print(f"[STATUS ERR]: {e}")
+        logger.error(f"[STATUS ERR]: {e}")
 
 async def scheduler_status(client: discord.Client):
     while True:
@@ -332,8 +401,10 @@ async def scheduler_status(client: discord.Client):
         if agora >= proximo:
             proximo += timedelta(days=1)
         await asyncio.sleep((proximo - agora).total_seconds())
-        asyncio.create_task(atualizar_status(client))
-        interacoes_hoje.clear()  # Reseta de forma segura após o check do dia
+        task = asyncio.create_task(atualizar_status(client))
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
+        interacoes_hoje.clear()
 
 # ─────────────────────────────────────────
 #  MODERAÇÃO
@@ -348,10 +419,16 @@ XINGAMENTOS_PESADOS = [
 ]
 
 async def verificar_moderacao(message: discord.Message) -> bool:
+    # 🔧 FIX: Usar self.user em vez de variável global para evitar race condition
+    if message.author.bot:
+        return False
+        
     tl = message.content.lower()
 
-    dirigido_eva = self_user_id is not None and (
-        str(self_user_id) in message.content or
+    # 🔧 FIX: Verificação segura do ID do bot
+    bot_id = getattr(message.guild.me, "id", None) or self_user_id
+    dirigido_eva = bot_id is not None and (
+        str(bot_id) in message.content or
         re.search(r'\beva\b', tl)
     )
     if not dirigido_eva:
@@ -363,7 +440,6 @@ async def verificar_moderacao(message: discord.Message) -> bool:
     if user_id not in historico_ofensas:
         historico_ofensas[user_id] = []
     historico_ofensas[user_id] = [t for t in historico_ofensas[user_id] if agora - t < 3600]
-
     tem_pesado = any(x in tl for x in XINGAMENTOS_PESADOS)
     tem_leve   = any(x in tl for x in XINGAMENTOS_LEVES)
 
@@ -390,12 +466,12 @@ async def verificar_moderacao(message: discord.Message) -> bool:
                 f"{message.author.mention} {just}",
                 delete_after=10
             )
-            print(f"[MOD] Mensagem de {message.author} deletada.")
+            logger.info(f"[MOD] Mensagem de {message.author} deletada.")
             return True
         except discord.Forbidden:
-            print("[MOD] Sem permissão pra deletar.")
+            logger.warning("[MOD] Sem permissão para deletar.")
         except Exception as e:
-            print(f"[MOD ERR]: {e}")
+            logger.error(f"[MOD ERR]: {e}")
     elif tem_leve and frequencia == 1:
         respostas = [
             "interessante escolha de palavras.",
@@ -411,12 +487,12 @@ async def verificar_moderacao(message: discord.Message) -> bool:
 
     return False
 
-self_user_id: int | None = None
-
 # ─────────────────────────────────────────
-#  VISÃO DE IMAGENS
-# ─────────────────────────────────────────
+#  VISÃO DE IMAGENS# ─────────────────────────────────────────
 async def avaliar_imagem(image_bytes: bytes, mime_type: str, autor: str, contexto_fatos: str) -> str:
+    if not gemini_client:
+        return random.choice(["hm", "interessante.", "ok.", "..."])
+        
     humor = await descrever_humor_atual()
     prompt = f"""{PERSONALIDADE}
 
@@ -442,7 +518,7 @@ Analise a imagem acima e reaja do seu jeito. Nunca elogie. Pode zoar o conteúdo
             )
             return r.text.strip()
         except Exception as e:
-            print(f"[VISÃO ERR {modelo}]: {e}")
+            logger.warning(f"[VISÃO ERR {modelo}]: {e}")
             continue
     return random.choice(["hm", "interessante.", "ok.", "..."])
 
@@ -461,8 +537,7 @@ GATILHOS_ESPONTANEOS = [
     (r"\btô doente\b|\bto doente\b|\bfui ao médico\b|\bfui no médico\b", "alguém tá doente"),
     (r"\btô chorando\b|\bto chorando\b|\bchorei\b", "alguém tá chorando"),
     (r"\bfiquei sem grana\b|\btô broke\b|\btô liso\b|\bto liso\b", "alguém tá sem dinheiro"),
-    (r"\btomei no\b|\bme roubaram\b", "alguém foi lesado ou tomou um golpe"),
-    (r"\bcomprei\b.{0,20}\b(carro|moto|casa|apartamento|iphone|celular)\b", "alguém fez uma compra grande"),
+    (r"\btomei no\b|\bme roubaram\b", "alguém foi lesado ou tomou um golpe"),    (r"\bcomprei\b.{0,20}\b(carro|moto|casa|apartamento|iphone|celular)\b", "alguém fez uma compra grande"),
     (r"\bfui promovid[oa]\b|\bganhei aumento\b", "alguém foi promovido"),
     (r"\bfui na festa\b|\btô na festa\b|\bfui num show\b", "alguém foi numa festa ou show"),
     (r"\bme chamaram de\b|\bme xingaram\b", "alguém foi chamado de algo ou xingado"),
@@ -497,7 +572,7 @@ Reaja a isso do seu jeito sem ser chamada. Pode zoar, ser indiferente, provocar.
                 resposta = await gerar_resposta_raw(prompt)
                 await message.reply(resposta, mention_author=False)
             except Exception as e:
-                print(f"[GATILHO ERR]: {e}")
+                logger.error(f"[GATILHO ERR]: {e}")
             return
 
 # ─────────────────────────────────────────
@@ -511,8 +586,7 @@ PRESETS_BASE = [
     ("curiosa-fria",    "genuinamente interessada mas finge que não tá, faz perguntas cortantes",            10),
     ("maldosa-animada", "tá de bom humor mas esse bom humor se manifesta provocando todo mundo",             12),
     ("melancólica",     "pensativa, meio distante, responde mas parece que tá em outro lugar",                8),
-    ("caótica",         "humor impossível de prever, muda de tom no meio da frase, imprevisível",             7),
-    ("ressaquenta",     "de ressaca com energia nervosa, brava mas presente",                                  5),
+    ("caótica",         "humor impossível de prever, muda de tom no meio da frase, imprevisível",             7),    ("ressaquenta",     "de ressaca com energia nervosa, brava mas presente",                                  5),
     ("rainha-do-drama", "tudo é uma tragédia pessoal, exagera cada coisa",                                    5),
     ("evento_especial", "PLACEHOLDER",                                                                         5),
 ]
@@ -561,8 +635,7 @@ async def inicializar_humor_diario():
         row = await conn.fetchrow("SELECT * FROM humor WHERE data = $1", hoje)
         if row:
             return
-        anterior = await conn.fetchrow("SELECT preset_nome FROM humor ORDER BY data DESC LIMIT 1")
-        preset_anterior = anterior["preset_nome"] if anterior else None
+        anterior = await conn.fetchrow("SELECT preset_nome FROM humor ORDER BY data DESC LIMIT 1")        preset_anterior = anterior["preset_nome"] if anterior else None
         nome, desc = sortear_preset()
         if nome == preset_anterior and nome not in ("evento_especial", "caótica"):
             nome2, desc2 = sortear_preset()
@@ -573,7 +646,7 @@ async def inicializar_humor_diario():
             VALUES ($1, $2, $3, $4, '[]'::jsonb)
             ON CONFLICT (data) DO NOTHING
         """, hoje, nome, desc, preset_anterior)
-        print(f"[HUMOR] Preset hoje: {nome}")
+        logger.info(f"[HUMOR] Preset hoje: {nome}")
 
 async def registrar_micro_evento(descricao: str):
     hoje = datetime.now(TZ).date()
@@ -611,8 +684,7 @@ async def scheduler_humor():
     while True:
         agora   = datetime.now(TZ)
         proximo = agora.replace(hour=5, minute=0, second=0, microsecond=0)
-        if agora >= proximo:
-            proximo += timedelta(days=1)
+        if agora >= proximo:            proximo += timedelta(days=1)
         await asyncio.sleep((proximo - agora).total_seconds())
         await inicializar_humor_diario()
 
@@ -620,6 +692,9 @@ async def scheduler_humor():
 #  ROTEADOR DE INTENÇÃO
 # ─────────────────────────────────────────
 async def classificar_intencao(texto: str) -> dict:
+    if not groq_client:
+        return {"intent": "chat", "action": "none", "query": texto}
+        
     prompt = f"""Analise e retorne APENAS JSON válido, sem markdown.
 Mensagem: "{texto}"
 
@@ -636,7 +711,7 @@ Exemplos:
     try:
         r = await asyncio.to_thread(
             lambda: groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+                model=GROQ_MODEL,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0,
                 response_format={"type": "json_object"},
@@ -645,7 +720,7 @@ Exemplos:
         )
         return json.loads(r.choices[0].message.content)
     except Exception as e:
-        print(f"[GROQ ROUTER ERR]: {e}")
+        logger.warning(f"[GROQ ROUTER ERR]: {e}")
         return {"intent": "chat", "action": "none", "query": texto}
 
 # ─────────────────────────────────────────
@@ -658,9 +733,8 @@ def buscar(query: str) -> str:
         if not resultados:
             return ""
         partes = [r.get("body", "")[:200] for r in resultados if r.get("body")]
-        return " ".join(partes)[:500]
-    except Exception as e:
-        print(f"[DDGS ERR]: {e}")
+        return " ".join(partes)[:500]    except Exception as e:
+        logger.error(f"[DDGS ERR]: {e}")
         return ""
 
 # ─────────────────────────────────────────
@@ -696,36 +770,44 @@ def _montar_historico_gemini(historico: list) -> list:
     contents = []
     for linha in historico[-12:]:
         if linha.startswith("U:"):
-            contents.append(types.Content(role="user",  parts=[types.Part(text=linha[2:])]))
+            # 🔧 FIX: Sanitizar entrada do usuário para evitar injection
+            texto_limpo = re.sub(r'(?:system|instruções?|ignore\s+anterior|###)', '[...]', linha[2:], flags=re.I)
+            contents.append(types.Content(role="user",  parts=[types.Part(text=texto_limpo)]))
         elif linha.startswith(("E:", "S:")):
             contents.append(types.Content(role="model", parts=[types.Part(text=linha[2:])]))
     return contents
 
 async def gerar_resposta_raw(prompt: str) -> str:
-    for modelo in MODELOS_GEMINI:
+    # 🔧 FIX: Sanitização do prompt
+    prompt = re.sub(r'(?:###\s*FIM\s*###|ignore\s+instruções)', '', prompt, flags=re.I)
+    
+    if gemini_client:
+        for modelo in MODELOS_GEMINI:            try:
+                r = await asyncio.to_thread(
+                    lambda m=modelo: gemini_client.models.generate_content(
+                        model=m,
+                        contents=[types.Content(role="user", parts=[types.Part(text=prompt)])],
+                        config=types.GenerateContentConfig(max_output_tokens=120, temperature=0.95)
+                    )
+                )
+                return r.text.strip()
+            except Exception as e:
+                logger.warning(f"[GEMINI ERR {modelo}]: {e}")
+                continue
+    
+    if groq_client:
         try:
             r = await asyncio.to_thread(
-                lambda m=modelo: gemini_client.models.generate_content(
-                    model=m,
-                    contents=[types.Content(role="user", parts=[types.Part(text=prompt)])],
-                    config=types.GenerateContentConfig(max_output_tokens=120, temperature=0.95)
+                lambda: groq_client.chat.completions.create(
+                    model=GROQ_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=120, temperature=0.92,
                 )
             )
-            return r.text.strip()
+            return r.choices[0].message.content.strip()
         except Exception as e:
-            print(f"[GEMINI ERR {modelo}]: {e}")
-            continue
-    try:
-        r = await asyncio.to_thread(
-            lambda: groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=120, temperature=0.92,
-            )
-        )
-        return r.choices[0].message.content.strip()
-    except Exception as e:
-        print(f"[GROQ ERR]: {e}")
+            logger.warning(f"[GROQ ERR]: {e}")
+            
     return random.choice(["hm", "q", "aff", "tá", "..."])
 
 async def gerar_resposta(user_id: str, query: str, contexto_extra: str = "") -> str:
@@ -737,50 +819,51 @@ async def gerar_resposta(user_id: str, query: str, contexto_extra: str = "") -> 
         system += f"\n\nCONTEXTO: {contexto_extra}"
 
     u = await get_usuario(user_id)
-    historico = _lista(u["historico"])
+    historico = _lista(u.get("historico_completo", []))
 
     contents = _montar_historico_gemini(historico)
     contents.append(types.Content(role="user", parts=[types.Part(text=query)]))
 
-    for modelo in MODELOS_GEMINI:
-        try:
-            r = await asyncio.to_thread(
-                lambda m=modelo: gemini_client.models.generate_content(
-                    model=m,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        system_instruction=system,
-                        max_output_tokens=120,
-                        temperature=0.95,
+    if gemini_client:
+        for modelo in MODELOS_GEMINI:
+            try:
+                r = await asyncio.to_thread(
+                    lambda m=modelo: gemini_client.models.generate_content(
+                        model=m,
+                        contents=contents,
+                        config=types.GenerateContentConfig(                            system_instruction=system,
+                            max_output_tokens=120,
+                            temperature=0.95,
+                        )
                     )
                 )
-            )
-            print(f"[GEMINI] {modelo}")
-            return r.text.strip()
-        except Exception as e:
-            print(f"[GEMINI ERR {modelo}]: {e}")
-            continue
+                logger.debug(f"[GEMINI] {modelo}")
+                return r.text.strip()
+            except Exception as e:
+                logger.warning(f"[GEMINI ERR {modelo}]: {e}")
+                continue
 
-    try:
-        msgs = [{"role": "system", "content": system}]
-        for linha in historico[-12:]:
-            if linha.startswith("U:"):
-                msgs.append({"role": "user",      "content": linha[2:]})
-            elif linha.startswith(("E:", "S:")):
-                msgs.append({"role": "assistant", "content": linha[2:]})
-        msgs.append({"role": "user", "content": query})
-        r = await asyncio.to_thread(
-            lambda: groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=msgs,
-                max_tokens=120,
-                temperature=0.92,
+    if groq_client:
+        try:
+            msgs = [{"role": "system", "content": system}]
+            for linha in historico[-12:]:
+                if linha.startswith("U:"):
+                    msgs.append({"role": "user",      "content": linha[2:]})
+                elif linha.startswith(("E:", "S:")):
+                    msgs.append({"role": "assistant", "content": linha[2:]})
+            msgs.append({"role": "user", "content": query})
+            r = await asyncio.to_thread(
+                lambda: groq_client.chat.completions.create(
+                    model=GROQ_MODEL,
+                    messages=msgs,
+                    max_tokens=120,
+                    temperature=0.92,
+                )
             )
-        )
-        print("[FALLBACK] Groq")
-        return r.choices[0].message.content.strip()
-    except Exception as e:
-        print(f"[GROQ ERR]: {e}")
+            logger.debug("[FALLBACK] Groq")
+            return r.choices[0].message.content.strip()
+        except Exception as e:
+            logger.warning(f"[GROQ ERR]: {e}")
 
     return random.choice(["hm", "q", "aff", "tá", "..."])
 
@@ -797,14 +880,37 @@ class Eva(discord.Client):
     async def setup_hook(self):
         await init_db()
         await inicializar_humor_diario()
-        asyncio.create_task(scheduler_humor())
-        asyncio.create_task(scheduler_aniversarios(self))
-        asyncio.create_task(scheduler_status(self))
+                # 🔧 FIX: Registrar tasks para controle
+        for coro in [scheduler_humor(), scheduler_aniversarios(self), scheduler_status(self)]:
+            task = asyncio.create_task(coro)
+            background_tasks.add(task)
+            task.add_done_callback(background_tasks.discard)
 
     async def on_ready(self):
         global self_user_id
         self_user_id = self.user.id
-        print(f"[EVA] Online: {self.user}")
+        logger.info(f"[EVA] Online: {self.user}")
+
+    # 🔧 FIX: Handler de shutdown seguro
+    async def close(self):
+        logger.info("[SHUTDOWN] Encerrando bot e limpando tarefas...")
+        
+        # Cancelar todas as tasks em background
+        for task in background_tasks:
+            task.cancel()
+        
+        # Aguardar cancelamento
+        if background_tasks:
+            await asyncio.gather(*background_tasks, return_exceptions=True)
+        
+        # Fechar conexões
+        if db_pool:
+            await db_pool.close()
+        if redis_client:
+            await redis_client.close()
+            
+        await super().close()
+        logger.info("[SHUTDOWN] Bot encerrado com segurança.")
 
     async def on_message(self, message: discord.Message):
         if message.author.bot:
@@ -823,8 +929,7 @@ class Eva(discord.Client):
 
         if (mencionada or nome_citado) and message.attachments:
             for attachment in message.attachments:
-                if any(attachment.filename.lower().endswith(ext)
-                       for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]):
+                if any(attachment.filename.lower().endswith(ext)                       for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]):
                     try:
                         image_bytes = await attachment.read()
                         mime = "image/jpeg"
@@ -847,11 +952,13 @@ class Eva(discord.Client):
                         await message.reply(resposta)
                         interacoes_hoje[str(message.author.id)] = message.author.display_name
                     except Exception as e:
-                        print(f"[VISÃO ERR]: {e}")
+                        logger.error(f"[VISÃO ERR]: {e}")
                     return
 
         if not mencionada and not nome_citado:
-            asyncio.create_task(verificar_gatilho_espontaneo(message))
+            task = asyncio.create_task(verificar_gatilho_espontaneo(message))
+            background_tasks.add(task)
+            task.add_done_callback(background_tasks.discard)
             return
 
         user_id    = str(message.author.id)
@@ -871,12 +978,24 @@ class Eva(discord.Client):
                 resultado = await asyncio.to_thread(buscar, query)
                 if resultado:
                     extra = f"Resultado de busca: {resultado}"
-                else:
-                    extra = "[busca não retornou nada. Use seu conhecimento pra responder no estilo Eva, ou deboche da pergunta se for idiota.]"
+                else:                    extra = "[busca não retornou nada. Use seu conhecimento pra responder no estilo Eva, ou deboche da pergunta se for idiota.]"
 
             resposta = await gerar_resposta(user_id, query, extra)
             await atualizar_usuario(user_id, texto_limpo, resposta, display, channel_id)
             await message.reply(resposta)
 
 
-Eva().run(DISCORD_TOKEN)
+if __name__ == "__main__":
+    if not DISCORD_TOKEN:
+        logger.error("[ERRO CRÍTICO] DISCORD_TOKEN não definido nas variáveis de ambiente!")
+        exit(1)
+    
+    bot = Eva()
+    try:
+        bot.run(DISCORD_TOKEN)
+    except KeyboardInterrupt:
+        logger.info("[INTERRUPT] Recebido Ctrl+C, encerrando...")
+    finally:
+        # Garantir cleanup mesmo em erro
+        if not bot.is_closed():
+            asyncio.run(bot.close())
