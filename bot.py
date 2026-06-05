@@ -1050,21 +1050,29 @@ class Eva(discord.Client):
         async with message.channel.typing():
             await asyncio.sleep(random.uniform(0.4, 1.2))
 
-            intent_data = await classificar_intencao(texto_limpo)
-            intent = intent_data.get("intent", "chat")
-            query  = intent_data.get("query", texto_limpo)
-            extra  = ""
+            try:
+                intent_data = await classificar_intencao(texto_limpo)
+                intent = intent_data.get("intent", "chat")
+                query  = intent_data.get("query", texto_limpo)
+                extra  = ""
 
-            if intent == "search":
-                resultado = await buscar(query)
-                extra = (
-                    f"Resultado de busca: {resultado}" if resultado
-                    else "[busca vazia. Use seu conhecimento no estilo Eva, ou deboche da pergunta.]"
-                )
+                if intent == "search":
+                    resultado = await buscar(query)
+                    extra = (
+                        f"Resultado de busca: {resultado}" if resultado
+                        else "[busca vazia. Use seu conhecimento no estilo Eva, ou deboche da pergunta.]"
+                    )
 
-            resposta = await gerar_resposta(user_id, query, extra)
-            await atualizar_usuario(user_id, texto_limpo, resposta, display, channel_id)
-            await message.reply(resposta)
+                resposta = await gerar_resposta(user_id, query, extra)
+                await atualizar_usuario(user_id, texto_limpo, resposta, display, channel_id)
+                await message.reply(resposta)
+
+            except Exception as e:
+                logger.error(f"[ON_MESSAGE ERR] {user_id}: {e}")
+                try:
+                    await message.reply(random.choice(["hm", "q", "aff", "tá", "..."]))
+                except Exception:
+                    pass
 
 
 # ─────────────────────────────────────────
