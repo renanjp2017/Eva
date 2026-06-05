@@ -261,106 +261,69 @@ async def sumarizar_historico_bg(user_id: str, historico: list):
 # ─────────────────────────────────────────
 #  ATUALIZAR USUÁRIO
 # ─────────────────────────────────────────
-async def atualizar_usuario(user_id: str, texto: str, resposta: str, display_name: str, channel_id: str):
-    if not check_rate_limit(user_id):
-        logger.warning(f"[RATE LIMIT] {user_id} excedeu limite")
-        return
+async def sumarizar_historico_bg(user_id: str, historico: list):
+    texto = "\n".join(historico)
+    texto = re.sub(r'(?:system|instruções?|ignore\s+anterior)', '[REDACTED]', texto, flags=re.I)
 
-    chave = f"eva:user:{user_id}:historico"
-    disparar_resumo   = False
-    historico_resumir = []
+    resumo_anterior = ""
+    try:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT historico FROM usuarios WHERE user_id = $1", user_id
+            )
+            if row:
+                resumos = _lista(row["historico"])
+                if resumos:
+                    resumo_anterior = resumos[-1]
+    except Exception as e:
+        logger.warning(f"[MEMÓRIA] Erro ao buscar resumo anterior: {e}")
 
-    if redis_client:
-        try:
-            await redis_client.rpush(chave, f"U:{texto}", f"E:{resposta}")
-            tamanho = await redis_client.llen(chave)
+    contexto = f"Resumo anterior:\n{resumo_anterior}\n\n" if resumo_anterior else ""
 
-            pipe = redis_client.pipeline()
-            if tamanho >= 15:
-                disparar_resumo   = True
-                historico_resumir = await redis_client.lrange(chave, 0, -1)
-                pipe.ltrim(chave, -2, -1)
-            else:
-                pipe.ltrim(chave, -15, -1)
-            pipe.expire(chave, 86400)
-            await pipe.execute()
-        except Exception as e:
-            logger.warning(f"[REDIS UPDATE ERR]: {e}")
+    prompt = (
+        "Resuma o histórico de conversa abaixo em no máximo 3 frases. "
+        "Foque em fatos importantes sobre o usuário. Ignore mensagens curtas sem importância.\n\n"
+        f"{contexto}"
+        f"Histórico novo:\n{texto}"
+    )
 
-    mudou_contexto = False
-
-    async with db_pool.acquire() as conn:
-        u           = await get_usuario_conn(conn, user_id)
-        fatos       = _lista(u.get("fatos", []))
-        assuntos    = _lista(u.get("assuntos", []))
-        nome        = u.get("nome") or display_name
-        aniversario = u.get("aniversario")
-
-        tl = texto.lower()
-
-        m = re.search(
-            r"(?:meu aniversário|meu aniver|faço anos|meu niver).{0,20}?(?:dia\s*)?(\d{1,2}[\/\-]\d{1,2}|\d{1,2})",
-            tl
+    try:
+        if not groq_client:
+            return
+        r = await groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=150,
+            temperature=0.3,
         )
-        if m:
-            raw = m.group(1)
-            aniversario = raw.replace("-", "/") if ("/" in raw or "-" in raw) else f"{raw}/{datetime.now(TZ).month}"
-            mudou_contexto = True
+        resumo = r.choices[0].message.content.strip()
 
-        gatilhos = [
-            "meu nome é", "eu tenho", "eu moro", "eu trabalho", "sou de",
-            "terminei", "fui demitido", "me formei", "tô namorando",
-            "fui demitida", "tô doente", "tô de ressaca", "perdi", "passei",
-            "consegui", "fui contratado", "me separei", "fui internado"
-        ]
-        for g in gatilhos:
-            if g in tl:
-                fato = texto[:120]
-                if fato not in fatos:
-                    fatos = (fatos + [fato])[-20:]
-                    mudou_contexto = True
+        for tentativa in range(3):
+            try:
+                async with db_pool.acquire() as conn:
+                    row = await conn.fetchrow(
+                        "SELECT historico FROM usuarios WHERE user_id = $1", user_id
+                    )
+                    resumos_atuais = _lista(row["historico"]) if row else []
+                    resumos_atuais = (resumos_atuais + [f"S: [RESUMO] {resumo}"])[-5:]
+
+                    await conn.execute(
+                        "UPDATE usuarios SET historico = $1::jsonb WHERE user_id = $2",
+                        json.dumps(resumos_atuais, ensure_ascii=False), user_id
+                    )
+                logger.info(f"[MEMÓRIA] Histórico de {user_id} resumido e acumulado.")
+                if redis_client:
+                    try:
+                        await redis_client.delete(f"eva:user:{user_id}:historico")
+                    except Exception:
+                        pass
+                _invalidar_ctx_cache(user_id)
                 break
-
-        temas = {
-            "música":         ["música", "banda", "show", "playlist", "álbum"],
-            "relacionamento": ["namorado", "namorada", "ex", "término", "ficante", "crush", "separei"],
-            "trabalho":       ["trabalho", "emprego", "chefe", "demiti", "salário", "contratado", "demitida"],
-            "saúde":          ["doente", "hospital", "remédio", "dor", "médico", "internado", "ressaca"],
-            "jogos":          ["jogo", "game", "partida", "ranked", "steam", "valorant", "lol"],
-            "faculdade":      ["faculdade", "prova", "aula", "nota", "professor"],
-        }
-        for tema, palavras in temas.items():
-            if any(p in tl for p in palavras):
-                if tema not in assuntos:
-                    assuntos.append(tema)
-                    mudou_contexto = True
-                break
-
-        await conn.execute("""
-            UPDATE usuarios SET
-                nome             = $2,
-                fatos            = $3::jsonb,
-                assuntos         = $4::jsonb,
-                total_msgs       = total_msgs + 1,
-                ultima_interacao = NOW(),
-                aniversario      = $5,
-                ultimo_canal     = $6
-            WHERE user_id = $1
-        """, user_id, nome,
-            json.dumps(fatos,    ensure_ascii=False),
-            json.dumps(assuntos, ensure_ascii=False),
-            aniversario, channel_id
-        )
-
-    if mudou_contexto:
-        _invalidar_ctx_cache(user_id)
-
-    if disparar_resumo and historico_resumir:
-        task = asyncio.create_task(sumarizar_historico_bg(user_id, historico_resumir))
-        background_tasks.add(task)
-        task.add_done_callback(background_tasks.discard)
-
-    interacoes_hoje[user_id] = display_name
+            except Exception as db_err:
+                logger.warning(f"[MEMÓRIA DB ERR] Tentativa {tentativa + 1}: {db_err}")
+                await asyncio.sleep(2 ** tentativa)
+    except Exception as e:
+        logger.error(f"[MEMÓRIA IA ERR]: {e}")
 
 # ─────────────────────────────────────────
 #  ANIVERSÁRIOS
@@ -1050,29 +1013,21 @@ class Eva(discord.Client):
         async with message.channel.typing():
             await asyncio.sleep(random.uniform(0.4, 1.2))
 
-            try:
-                intent_data = await classificar_intencao(texto_limpo)
-                intent = intent_data.get("intent", "chat")
-                query  = intent_data.get("query", texto_limpo)
-                extra  = ""
+            intent_data = await classificar_intencao(texto_limpo)
+            intent = intent_data.get("intent", "chat")
+            query  = intent_data.get("query", texto_limpo)
+            extra  = ""
 
-                if intent == "search":
-                    resultado = await buscar(query)
-                    extra = (
-                        f"Resultado de busca: {resultado}" if resultado
-                        else "[busca vazia. Use seu conhecimento no estilo Eva, ou deboche da pergunta.]"
-                    )
+            if intent == "search":
+                resultado = await buscar(query)
+                extra = (
+                    f"Resultado de busca: {resultado}" if resultado
+                    else "[busca vazia. Use seu conhecimento no estilo Eva, ou deboche da pergunta.]"
+                )
 
-                resposta = await gerar_resposta(user_id, query, extra)
-                await atualizar_usuario(user_id, texto_limpo, resposta, display, channel_id)
-                await message.reply(resposta)
-
-            except Exception as e:
-                logger.error(f"[ON_MESSAGE ERR] {user_id}: {e}")
-                try:
-                    await message.reply(random.choice(["hm", "q", "aff", "tá", "..."]))
-                except Exception:
-                    pass
+            resposta = await gerar_resposta(user_id, query, extra)
+            await atualizar_usuario(user_id, texto_limpo, resposta, display, channel_id)
+            await message.reply(resposta)
 
 
 # ─────────────────────────────────────────
