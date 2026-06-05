@@ -1,0 +1,9 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir discord.py
+
+COPY truco_bot.py .
+
+CMD ["python", "-u", "truco_bot.py"]
