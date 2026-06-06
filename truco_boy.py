@@ -503,6 +503,9 @@ async def nova_rodada(canal, jogo: JogoTruco):
 ])
 async def cmd_truco(interaction: discord.Interaction, modo: str = "1v1"):
     canal_id = interaction.channel_id
+    if not checar_canal(canal_id):
+        await interaction.response.send_message("🎰 Os jogos só funcionam no canal do cassino!", ephemeral=True)
+        return
     if canal_id in jogos:
         await interaction.response.send_message("Já tem um jogo nesse canal! Use `/encerrar` para cancelar.", ephemeral=True)
         return
@@ -973,6 +976,9 @@ class EntrarBJView(discord.ui.View):
 @bot.tree.command(name="21", description="Inicia uma mesa de Blackjack (21)")
 async def cmd_21(interaction: discord.Interaction):
     canal_id = interaction.channel_id
+    if not checar_canal(canal_id):
+        await interaction.response.send_message("🎰 Os jogos só funcionam no canal do cassino!", ephemeral=True)
+        return
     if canal_id in mesas_bj:
         await interaction.response.send_message("Já tem uma mesa aqui! Use `/21_encerrar` para cancelar.", ephemeral=True)
         return
@@ -1538,6 +1544,9 @@ class EntrarPokerView(discord.ui.View):
 @bot.tree.command(name="poker", description="Abre uma mesa de Texas Hold'em")
 async def cmd_poker(interaction: discord.Interaction):
     canal_id = interaction.channel_id
+    if not checar_canal(canal_id):
+        await interaction.response.send_message("🎰 Os jogos só funcionam no canal do cassino!", ephemeral=True)
+        return
     if canal_id in mesas_poker:
         await interaction.response.send_message("Já tem uma mesa aqui! Use `/poker_encerrar`.", ephemeral=True)
         return
@@ -1725,35 +1734,7 @@ async def executar_acao_ia_poker(canal, mesa: "MesaPoker", jog: "JogadorPoker"):
     await pedir_acao_poker(canal, mesa)
 
 
-# ─────────────────────────────────────────
-#  PATCH: checar canal em todos os comandos
-# ─────────────────────────────────────────
-# Monkey-patch: wrap original commands to check casino channel
-_orig_truco    = cmd_truco.callback
-_orig_21       = cmd_21.callback
-_orig_poker    = cmd_poker.callback
-
-async def _truco_checked(interaction: discord.Interaction, modo: str = "1v1"):
-    if not checar_canal(interaction.channel_id):
-        await interaction.response.send_message("🎰 Os jogos só funcionam no canal do cassino!", ephemeral=True)
-        return
-    await _orig_truco(interaction, modo)
-
-async def _21_checked(interaction: discord.Interaction):
-    if not checar_canal(interaction.channel_id):
-        await interaction.response.send_message("🎰 Os jogos só funcionam no canal do cassino!", ephemeral=True)
-        return
-    await _orig_21(interaction)
-
-async def _poker_checked(interaction: discord.Interaction):
-    if not checar_canal(interaction.channel_id):
-        await interaction.response.send_message("🎰 Os jogos só funcionam no canal do cassino!", ephemeral=True)
-        return
-    await _orig_poker(interaction)
-
-cmd_truco.callback = _truco_checked
-cmd_21.callback    = _21_checked
-cmd_poker.callback = _poker_checked
+# Canal cassino verificado diretamente em cada comando.
 
 
 # ─────────────────────────────────────────
