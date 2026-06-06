@@ -10,7 +10,8 @@ from typing import Optional
 # ─────────────────────────────────────────
 #  CONFIGURAÇÃO
 # ─────────────────────────────────────────
-TOKEN = "SEU_TOKEN_AQUI"
+import os
+TOKEN = os.environ.get("DISCORD_TOKEN", "")
 
 intents = discord.Intents.default()
 intents.message_content = True
