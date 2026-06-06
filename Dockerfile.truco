@@ -4,6 +4,6 @@ WORKDIR /app
 
 RUN pip install --no-cache-dir discord.py
 
-COPY truco_bot.py .
+COPY truco_boy.py .
 
-CMD ["python", "-u", "truco_bot.py"]
+CMD ["python", "-u", "truco_boy.py"]
