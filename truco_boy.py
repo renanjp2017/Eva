@@ -3,15 +3,22 @@ from discord.ext import commands
 from discord import app_commands
 import random
 import asyncio
+import json
 from enum import Enum
 from dataclasses import dataclass, field
 from typing import Optional
+try:
+    import asyncpg
+    HAS_PG = True
+except ImportError:
+    HAS_PG = False
 
 # ─────────────────────────────────────────
 #  CONFIGURAÇÃO
 # ─────────────────────────────────────────
 import os
-TOKEN = os.environ.get("DISCORD_TOKEN", "")
+TOKEN    = os.environ.get("DISCORD_TOKEN", "")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -615,14 +622,43 @@ APOSTA_MAXIMA     = 500
 NAIPES_BJ  = ["♠", "♥", "♦", "♣"]
 NUMEROS_BJ = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
 
-fichas: dict[int, int] = {}   # user_id -> fichas
+fichas: dict[int, int] = {}   # cache em memória
 mesas_bj: dict[int, "MesaBJ"] = {}  # canal_id -> mesa
+db_pool = None  # asyncpg pool
 
 def get_fichas(user_id: int) -> int:
     return fichas.get(user_id, FICHAS_INICIAIS)
 
 def set_fichas(user_id: int, valor: int):
     fichas[user_id] = max(0, valor)
+    # Persiste em background sem bloquear
+    asyncio.create_task(_salvar_fichas(user_id, max(0, valor)))
+
+async def _salvar_fichas(user_id: int, valor: int):
+    if not db_pool:
+        return
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO cassino_fichas (user_id, fichas)
+                VALUES ($1, $2)
+                ON CONFLICT (user_id) DO UPDATE SET fichas = $2
+            """, str(user_id), valor)
+    except Exception as e:
+        print(f"[DB] Erro ao salvar fichas: {e}")
+
+async def _carregar_fichas():
+    """Carrega todas as fichas do DB para memória no startup."""
+    if not db_pool:
+        return
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch("SELECT user_id, fichas FROM cassino_fichas")
+            for row in rows:
+                fichas[int(row["user_id"])] = row["fichas"]
+        print(f"[DB] {len(fichas)} saldos carregados.")
+    except Exception as e:
+        print(f"[DB] Erro ao carregar fichas: {e}")
 
 def gerar_baralho_bj():
     b = [f"{n}{s}" for n in NUMEROS_BJ for s in NAIPES_BJ]
@@ -1909,11 +1945,617 @@ setattr(_mod, 'processar_jogada', processar_jogada)
 pedir_jogada.__globals__['processar_jogada'] = processar_jogada
 
 
+# ═════════════════════════════════════════
+#  ROLETA
+# ═════════════════════════════════════════
+ROLETA_NUMEROS = list(range(0, 37))  # 0-36
+ROLETA_VERMELHOS = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
+ROLETA_PRETOS   = {2,4,6,8,10,11,13,15,17,20,22,24,26,28,29,31,33,35}
+
+def roleta_cor(n: int) -> str:
+    if n == 0: return "verde"
+    return "vermelho" if n in ROLETA_VERMELHOS else "preto"
+
+def roleta_pagar(aposta_tipo: str, aposta_val: str, resultado: int) -> float:
+    """Retorna multiplicador do pagamento (0 = perdeu)."""
+    r = resultado
+    t = aposta_tipo
+    if t == "numero":
+        return 35.0 if str(r) == aposta_val else 0
+    if t == "cor":
+        cor = roleta_cor(r)
+        return 2.0 if cor == aposta_val and r != 0 else 0
+    if t == "paridade":
+        if r == 0: return 0
+        par = "par" if r % 2 == 0 else "impar"
+        return 2.0 if par == aposta_val else 0
+    if t == "metade":
+        if r == 0: return 0
+        metade = "baixo" if r <= 18 else "alto"
+        return 2.0 if metade == aposta_val else 0
+    if t == "dezena":
+        dezenas = {"1": range(1,13), "2": range(13,25), "3": range(25,37)}
+        return 3.0 if r in dezenas.get(aposta_val, []) else 0
+    return 0
+
+
+class RoletaApostaModal(discord.ui.Modal, title="Apostar na Roleta"):
+    tipo = discord.ui.TextInput(
+        label="Tipo: numero/cor/paridade/metade/dezena",
+        placeholder="ex: cor"
+    )
+    valor = discord.ui.TextInput(
+        label="Valor da aposta",
+        placeholder="ex: vermelho / 17 / par / baixo / 1"
+    )
+    fichas_apostar = discord.ui.TextInput(
+        label="Fichas",
+        placeholder="ex: 50"
+    )
+
+    def __init__(self, canal_id: int):
+        super().__init__()
+        self.canal_id = canal_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        user    = interaction.user
+        tipo    = self.tipo.value.strip().lower()
+        val     = self.valor.value.strip().lower()
+        saldo   = get_fichas(user.id)
+
+        tipos_validos = ["numero", "cor", "paridade", "metade", "dezena"]
+        if tipo not in tipos_validos:
+            await interaction.response.send_message(
+                f"Tipo inválido! Use: {', '.join(tipos_validos)}", ephemeral=True)
+            return
+
+        try:
+            aposta = max(APOSTA_MINIMA, min(int(self.fichas_apostar.value), APOSTA_MAXIMA, saldo))
+        except ValueError:
+            await interaction.response.send_message("Fichas inválidas.", ephemeral=True)
+            return
+
+        if saldo < aposta:
+            await interaction.response.send_message(f"Saldo insuficiente! Você tem {saldo} 🪙", ephemeral=True)
+            return
+
+        resultado = random.randint(0, 36)
+        cor       = roleta_cor(resultado)
+        multi     = roleta_pagar(tipo, val, resultado)
+
+        emoji_cor = {"verde": "🟢", "vermelho": "🔴", "preto": "⚫"}.get(cor, "")
+        set_fichas(user.id, saldo - aposta)
+
+        if multi > 0:
+            ganho = int(aposta * multi)
+            set_fichas(user.id, get_fichas(user.id) + ganho)
+            txt = (f"🎰 **Roleta!** Resultado: **{resultado}** {emoji_cor} {cor}\n\n"
+                   f"✅ Sua aposta ({tipo}: **{val}**) GANHOU! Recebeu: **{ganho} 🪙** (x{multi:.0f})\n"
+                   f"Saldo: **{get_fichas(user.id)} 🪙**")
+        else:
+            txt = (f"🎰 **Roleta!** Resultado: **{resultado}** {emoji_cor} {cor}\n\n"
+                   f"❌ Sua aposta ({tipo}: **{val}**) perdeu. Perdeu: **{aposta} 🪙**\n"
+                   f"Saldo: **{get_fichas(user.id)} 🪙**")
+
+        await interaction.response.send_message(txt)
+
+
+class RoletaView(discord.ui.View):
+    def __init__(self, canal_id: int):
+        super().__init__(timeout=60)
+        self.canal_id = canal_id
+
+    @discord.ui.button(label="Fazer aposta", style=discord.ButtonStyle.primary, emoji="🎰")
+    async def apostar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(RoletaApostaModal(self.canal_id))
+
+    @discord.ui.button(label="Girar sem aposta", style=discord.ButtonStyle.secondary, emoji="🎡")
+    async def girar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        resultado = random.randint(0, 36)
+        cor  = roleta_cor(resultado)
+        emoji_cor = {"verde": "🟢", "vermelho": "🔴", "preto": "⚫"}.get(cor, "")
+        await interaction.response.send_message(
+            f"🎡 Roleta girou: **{resultado}** {emoji_cor} {cor} (sem aposta)"
+        )
+
+
+@bot.tree.command(name="roleta", description="Jogue na roleta do cassino")
+async def cmd_roleta(interaction: discord.Interaction):
+    if not checar_canal(interaction.channel_id):
+        await interaction.response.send_message("🎰 Os jogos só funcionam no canal do cassino!", ephemeral=True)
+        return
+    saldo = get_fichas(interaction.user.id)
+    embed = discord.Embed(title="🎰 Roleta", color=0x8B0000)
+    embed.add_field(name="Como apostar", value=(
+        "**numero** — aposte num número (0-36) → paga 35x\n"
+        "**cor** — vermelho/preto/verde → paga 2x\n"
+        "**paridade** — par/impar → paga 2x\n"
+        "**metade** — baixo(1-18)/alto(19-36) → paga 2x\n"
+        "**dezena** — 1(1-12)/2(13-24)/3(25-36) → paga 3x"
+    ), inline=False)
+    embed.set_footer(text=f"Seu saldo: {saldo} 🪙")
+    await interaction.response.send_message(embed=embed, view=RoletaView(interaction.channel_id))
+
+
+# ═════════════════════════════════════════
+#  JOGO DO BICHO
+# ═════════════════════════════════════════
+BICHOS = [
+    ("Avestruz", [1,2,3,4]), ("Águia", [5,6,7,8]), ("Burro", [9,10,11,12]),
+    ("Borboleta", [13,14,15,16]), ("Cachorro", [17,18,19,20]),
+    ("Cabra", [21,22,23,24]), ("Carneiro", [25,26,27,28]),
+    ("Camelo", [29,30,31,32]), ("Cobra", [33,34,35,36]),
+    ("Coelho", [37,38,39,40]), ("Cavalo", [41,42,43,44]),
+    ("Elefante", [45,46,47,48]), ("Galo", [49,50,51,52]),
+    ("Gato", [53,54,55,56]), ("Jacaré", [57,58,59,60]),
+    ("Leão", [61,62,63,64]), ("Macaco", [65,66,67,68]),
+    ("Porco", [69,70,71,72]), ("Pavão", [73,74,75,76]),
+    ("Peru", [77,78,79,80]), ("Touro", [81,82,83,84]),
+    ("Tigre", [85,86,87,88]), ("Urso", [89,90,91,92]),
+    ("Veado", [93,94,95,96]), ("Vaca", [97,98,99,0]),
+]
+BICHOS_NOMES = [b[0] for b in BICHOS]
+
+def sorteio_bicho():
+    numero = random.randint(0, 99)
+    for nome, nums in BICHOS:
+        if numero in nums or (numero == 0 and 0 in nums):
+            return nome, numero
+    return BICHOS[-1][0], numero
+
+def nome_para_bicho(nome: str):
+    for b_nome, nums in BICHOS:
+        if b_nome.lower() == nome.lower():
+            return b_nome, nums
+    return None, None
+
+
+class BichoModal(discord.ui.Modal, title="Jogo do Bicho"):
+    bicho = discord.ui.TextInput(
+        label="Qual bicho? (ex: Gato, Leão, Tigre...)",
+        placeholder="Digite o nome do bicho"
+    )
+    aposta = discord.ui.TextInput(
+        label="Fichas",
+        placeholder="ex: 100"
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        user  = interaction.user
+        saldo = get_fichas(user.id)
+        nome_b, _ = nome_para_bicho(self.bicho.value)
+
+        if not nome_b:
+            lista = ", ".join(BICHOS_NOMES[:10]) + "..."
+            await interaction.response.send_message(
+                f"Bicho inválido! Exemplos: {lista}", ephemeral=True)
+            return
+
+        try:
+            valor = max(APOSTA_MINIMA, min(int(self.aposta.value), APOSTA_MAXIMA, saldo))
+        except ValueError:
+            await interaction.response.send_message("Valor inválido.", ephemeral=True)
+            return
+
+        if saldo < valor:
+            await interaction.response.send_message(f"Saldo insuficiente! Você tem {saldo} 🪙", ephemeral=True)
+            return
+
+        resultado, numero = sorteio_bicho()
+        set_fichas(user.id, saldo - valor)
+
+        if resultado.lower() == nome_b.lower():
+            ganho = valor * 18
+            set_fichas(user.id, get_fichas(user.id) + ganho)
+            txt = (f"🦁 **Jogo do Bicho!**\n"
+                   f"Número sorteado: **{numero:02d}** → **{resultado}**\n\n"
+                   f"🎉 GANHOU! Você apostou em **{nome_b}** e acertou!\n"
+                   f"Recebeu: **{ganho} 🪙** (x18)\n"
+                   f"Saldo: **{get_fichas(user.id)} 🪙**")
+        else:
+            txt = (f"🦁 **Jogo do Bicho!**\n"
+                   f"Número sorteado: **{numero:02d}** → **{resultado}**\n\n"
+                   f"❌ Você apostou em **{nome_b}** e perdeu.\n"
+                   f"Perdeu: **{valor} 🪙**\n"
+                   f"Saldo: **{get_fichas(user.id)} 🪙**")
+
+        await interaction.response.send_message(txt)
+
+
+class BichoView(discord.ui.View):
+    @discord.ui.button(label="Apostar", style=discord.ButtonStyle.primary, emoji="🦁")
+    async def apostar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BichoModal())
+
+    @discord.ui.button(label="Ver bichos", style=discord.ButtonStyle.secondary, emoji="📋")
+    async def ver_bichos(self, interaction: discord.Interaction, button: discord.ui.Button):
+        lista = "\n".join(f"**{b[0]}**: {b[1][0]:02d}-{b[1][-1]:02d}" for b in BICHOS)
+        await interaction.response.send_message(f"🦁 **Bichos:**\n{lista}", ephemeral=True)
+
+
+@bot.tree.command(name="bicho", description="Aposte no Jogo do Bicho")
+async def cmd_bicho(interaction: discord.Interaction):
+    if not checar_canal(interaction.channel_id):
+        await interaction.response.send_message("🎰 Os jogos só funcionam no canal do cassino!", ephemeral=True)
+        return
+    saldo = get_fichas(interaction.user.id)
+    embed = discord.Embed(title="🦁 Jogo do Bicho", color=0x228B22)
+    embed.description = (
+        "Aposte num bicho e torça pro número sair!\n"
+        "São **25 bichos**, cada um com 4 números (00-99).\n"
+        "Acertar paga **18x** a aposta!\n\n"
+        "Clique em **Ver bichos** para ver a lista completa."
+    )
+    embed.set_footer(text=f"Seu saldo: {saldo} 🪙")
+    await interaction.response.send_message(embed=embed, view=BichoView())
+
+
+# ═════════════════════════════════════════
+#  UNO
+# ═════════════════════════════════════════
+UNO_CORES   = ["🔴", "🔵", "🟡", "🟢"]
+UNO_VALORES = ["0","1","2","3","4","5","6","7","8","9","+2","🚫","↩️"]
+UNO_ESPECIAIS = ["🃏+4", "🃏cor"]  # wild cards
+
+mesas_uno: dict[int, "MesaUno"] = {}
+
+def gerar_baralho_uno():
+    deck = []
+    for cor in UNO_CORES:
+        for val in UNO_VALORES:
+            deck.append(f"{cor}{val}")
+            if val != "0":
+                deck.append(f"{cor}{val}")  # duas cópias exceto 0
+    for _ in range(4):
+        deck.append("🃏+4")
+        deck.append("🃏cor")
+    random.shuffle(deck)
+    return deck
+
+def carta_uno_jogavel(carta: str, topo: str, cor_curinga: str) -> bool:
+    if carta.startswith("🃏"):
+        return True
+    topo_cor = topo[:2] if topo.startswith("🃏") else topo[0] if topo[0] in "🔴🔵🟡🟢" else topo[:2]
+    carta_cor = carta[:2] if carta[:2] in UNO_CORES else carta[0]
+    topo_cor  = cor_curinga if topo.startswith("🃏") else topo_cor
+    if carta_cor == topo_cor:
+        return True
+    topo_val  = topo[2:] if topo[:2] in UNO_CORES else topo[1:]
+    carta_val = carta[2:] if carta[:2] in UNO_CORES else carta[1:]
+    return carta_val == topo_val
+
+@dataclass
+class MesaUno:
+    canal_id: int
+    iniciador_id: int
+    jogadores: list = field(default_factory=list)
+    maos: dict = field(default_factory=dict)      # user_id -> [cartas]
+    baralho: list = field(default_factory=list)
+    descarte: list = field(default_factory=list)
+    vez_idx: int = 0
+    direcao: int = 1  # 1 = horário, -1 = anti-horário
+    estado: str = "aguardando"
+    cor_curinga: str = ""
+    pendurado: int = 0  # +2 ou +4 acumulado
+
+    def topo(self): return self.descarte[-1] if self.descarte else ""
+    def jogador_atual(self): return self.jogadores[self.vez_idx % len(self.jogadores)]
+    def avancar(self, n=1):
+        self.vez_idx = (self.vez_idx + self.direcao * n) % len(self.jogadores)
+    def get_mao(self, uid): return self.maos.get(uid, [])
+
+
+async def iniciar_uno(canal, mesa: MesaUno):
+    mesa.estado  = "jogando"
+    mesa.baralho = gerar_baralho_uno()
+    mesa.descarte = []
+    mesa.vez_idx  = 0
+    mesa.direcao  = 1
+    mesa.pendurado = 0
+
+    for j in mesa.jogadores:
+        mesa.maos[j.id] = [mesa.baralho.pop() for _ in range(7)]
+
+    # Primeira carta (não pode ser especial)
+    while True:
+        carta = mesa.baralho.pop()
+        if not carta.startswith("🃏") and "+" not in carta and "🚫" not in carta and "↩️" not in carta:
+            break
+        mesa.baralho.insert(0, carta)
+    mesa.descarte.append(carta)
+
+    await canal.send(
+        f"🃏 **UNO iniciado!** Jogadores: {', '.join(j.display_name for j in mesa.jogadores)}\n"
+        f"Carta inicial: **{carta}**\n\nCartas enviadas por DM!"
+    )
+    for j in mesa.jogadores:
+        await enviar_mao_uno(j, mesa)
+    await pedir_turno_uno(canal, mesa)
+
+
+async def enviar_mao_uno(jogador, mesa: MesaUno):
+    cartas = mesa.get_mao(jogador.id)
+    txt = "🃏 **Sua mão no UNO:**\n" + "  ".join(f"`{c}`" for c in cartas)
+    txt += f"\n\nCarta no topo: `{mesa.topo()}`"
+    try:
+        await jogador.send(txt)
+    except Exception:
+        pass
+
+
+async def pedir_turno_uno(canal, mesa: MesaUno):
+    atual = mesa.jogador_atual()
+    cartas = mesa.get_mao(atual.id)
+    jogaveis = [c for c in cartas if carta_uno_jogavel(c, mesa.topo(), mesa.cor_curinga)]
+    embed = discord.Embed(title="🃏 UNO", color=0xff4444)
+    embed.add_field(name="Topo", value=f"`{mesa.topo()}`", inline=True)
+    embed.add_field(name="Vez de", value=atual.display_name, inline=True)
+    embed.add_field(name="Cartas na mão", value=" ".join(f"`{c}`" for c in cartas) or "nenhuma", inline=False)
+    if mesa.pendurado > 0:
+        embed.add_field(name="⚠️ Pendurado", value=f"+{mesa.pendurado} cartas!", inline=False)
+
+    if not jogaveis:
+        # Compra carta automaticamente
+        if mesa.baralho:
+            nova = mesa.baralho.pop()
+            cartas.append(nova)
+            await canal.send(f"🃏 **{atual.display_name}** não tem carta jogável e comprou `{nova}`.", embed=embed)
+            if carta_uno_jogavel(nova, mesa.topo(), mesa.cor_curinga):
+                await pedir_turno_uno(canal, mesa)
+            else:
+                mesa.avancar()
+                await pedir_turno_uno(canal, mesa)
+        return
+
+    view = UnoJogarView(mesa, atual)
+    await canal.send(f"🃏 **{atual.mention}** é sua vez!", embed=embed, view=view)
+
+
+class EscolherCorView(discord.ui.View):
+    def __init__(self, mesa: MesaUno, carta: str):
+        super().__init__(timeout=30)
+        self.mesa  = mesa
+        self.carta = carta
+        for cor in UNO_CORES:
+            self.add_item(CorButton(cor, mesa, carta))
+
+class CorButton(discord.ui.Button):
+    def __init__(self, cor: str, mesa: MesaUno, carta: str):
+        super().__init__(label=cor, style=discord.ButtonStyle.primary)
+        self.cor   = cor
+        self.mesa  = mesa
+        self.carta = carta
+
+    async def callback(self, interaction: discord.Interaction):
+        mesa = self.mesa
+        if interaction.user.id != mesa.jogador_atual().id:
+            await interaction.response.send_message("Não é sua vez!", ephemeral=True)
+            return
+        await interaction.response.defer()
+        self.view.stop()
+        mesa.cor_curinga = self.cor
+        canal = interaction.channel
+        await canal.send(f"🃏 Cor escolhida: **{self.cor}**")
+        mesa.avancar()
+        await pedir_turno_uno(canal, mesa)
+
+
+class UnoJogarView(discord.ui.View):
+    def __init__(self, mesa: MesaUno, jogador):
+        super().__init__(timeout=60)
+        self.mesa    = mesa
+        self.jogador = jogador
+        cartas = mesa.get_mao(jogador.id)
+        jogaveis = [c for c in cartas if carta_uno_jogavel(c, mesa.topo(), mesa.cor_curinga)]
+        for carta in jogaveis[:20]:  # max 20 botões
+            self.add_item(UnoCartaButton(carta, mesa, jogador))
+
+    @discord.ui.button(label="Comprar carta", style=discord.ButtonStyle.danger, emoji="📥", row=4)
+    async def comprar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.jogador.id:
+            await interaction.response.send_message("Não é sua vez!", ephemeral=True)
+            return
+        await interaction.response.defer()
+        self.stop()
+        mesa = self.mesa
+        if mesa.baralho:
+            nova = mesa.baralho.pop()
+            mesa.get_mao(self.jogador.id).append(nova)
+            await interaction.channel.send(f"📥 **{self.jogador.display_name}** comprou uma carta.")
+        mesa.avancar()
+        await pedir_turno_uno(interaction.channel, mesa)
+
+
+class UnoCartaButton(discord.ui.Button):
+    def __init__(self, carta: str, mesa: MesaUno, jogador):
+        super().__init__(label=carta, style=discord.ButtonStyle.success)
+        self.carta   = carta
+        self.mesa    = mesa
+        self.jogador = jogador
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.jogador.id:
+            await interaction.response.send_message("Não é sua vez!", ephemeral=True)
+            return
+        await interaction.response.defer()
+        self.view.stop()
+        mesa  = self.mesa
+        carta = self.carta
+        mao   = mesa.get_mao(self.jogador.id)
+        if carta not in mao:
+            return
+        mao.remove(carta)
+        mesa.descarte.append(carta)
+        canal = interaction.channel
+
+        # Verifica UNO e vitória
+        if len(mao) == 0:
+            await canal.send(f"🎉 **{self.jogador.display_name} ganhou o UNO!**")
+            mesas_uno.pop(mesa.canal_id, None)
+            return
+        if len(mao) == 1:
+            await canal.send(f"⚠️ **{self.jogador.display_name}**: UNO!")
+
+        # Efeitos especiais
+        val = carta[2:] if carta[:2] in UNO_CORES else carta
+        if carta.startswith("🃏"):
+            # Curinga — pede cor
+            if "+4" in carta:
+                mesa.pendurado += 4
+            mesa.avancar()
+            view = EscolherCorView(mesa, carta)
+            await canal.send(f"🃏 **{self.jogador.display_name}** jogou `{carta}`! Escolha a cor:", view=view)
+            return
+        elif "+2" in val:
+            mesa.pendurado += 2
+            mesa.avancar()
+            # Próximo compra
+            prox = mesa.jogador_atual()
+            if mesa.pendurado > 0:
+                for _ in range(mesa.pendurado):
+                    if mesa.baralho:
+                        mesa.get_mao(prox.id).append(mesa.baralho.pop())
+                await canal.send(f"😬 **{prox.display_name}** comprou **{mesa.pendurado}** cartas!")
+                mesa.pendurado = 0
+                mesa.avancar()
+        elif "🚫" in val:
+            mesa.avancar()
+            prox = mesa.jogador_atual()
+            await canal.send(f"🚫 **{prox.display_name}** foi bloqueado!")
+            mesa.avancar()
+        elif "↩️" in val:
+            mesa.direcao *= -1
+            await canal.send(f"↩️ Direção invertida!")
+            mesa.avancar()
+        else:
+            mesa.avancar()
+
+        await pedir_turno_uno(canal, mesa)
+
+
+class EntrarUnoView(discord.ui.View):
+    def __init__(self, mesa: MesaUno):
+        super().__init__(timeout=120)
+        self.mesa = mesa
+
+    @discord.ui.button(label="Entrar", style=discord.ButtonStyle.success, emoji="🃏")
+    async def entrar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        mesa = self.mesa
+        if interaction.user in mesa.jogadores:
+            await interaction.response.send_message("Você já está na mesa!", ephemeral=True)
+            return
+        if len(mesa.jogadores) >= 8:
+            await interaction.response.send_message("Mesa cheia! (máx 8)", ephemeral=True)
+            return
+        mesa.jogadores.append(interaction.user)
+        await interaction.response.send_message(
+            f"✅ **{interaction.user.display_name}** entrou! ({len(mesa.jogadores)}/8)"
+        )
+
+    @discord.ui.button(label="Iniciar", style=discord.ButtonStyle.primary, emoji="▶️")
+    async def iniciar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        mesa = self.mesa
+        if interaction.user.id != mesa.iniciador_id:
+            await interaction.response.send_message("Só quem criou pode iniciar.", ephemeral=True)
+            return
+        if len(mesa.jogadores) < 2:
+            await interaction.response.send_message("Precisa de pelo menos 2 jogadores.", ephemeral=True)
+            return
+        self.stop()
+        await interaction.response.send_message("▶️ Iniciando UNO!")
+        await iniciar_uno(interaction.channel, mesa)
+
+
+@bot.tree.command(name="uno", description="Inicia uma partida de UNO (2-8 jogadores)")
+async def cmd_uno(interaction: discord.Interaction):
+    if not checar_canal(interaction.channel_id):
+        await interaction.response.send_message("🎰 Os jogos só funcionam no canal do cassino!", ephemeral=True)
+        return
+    canal_id = interaction.channel_id
+    if canal_id in mesas_uno:
+        await interaction.response.send_message("Já tem UNO aqui! Use `/uno_encerrar`.", ephemeral=True)
+        return
+    mesa = MesaUno(canal_id=canal_id, iniciador_id=interaction.user.id)
+    mesa.jogadores.append(interaction.user)
+    mesas_uno[canal_id] = mesa
+    embed = discord.Embed(title="🃏 UNO", color=0xff4444,
+        description=f"**{interaction.user.display_name}** criou UNO!\nEntre e aguarde o início.\n2–8 jogadores.")
+    await interaction.response.send_message(embed=embed, view=EntrarUnoView(mesa))
+
+
+@bot.tree.command(name="uno_encerrar", description="Encerra o UNO atual")
+async def cmd_uno_encerrar(interaction: discord.Interaction):
+    mesa = mesas_uno.pop(interaction.channel_id, None)
+    if not mesa:
+        await interaction.response.send_message("Não tem UNO aqui.", ephemeral=True)
+        return
+    await interaction.response.send_message("❌ UNO encerrado.")
+
+
+# ═════════════════════════════════════════
+#  AJUDA
+# ═════════════════════════════════════════
+@bot.tree.command(name="ajuda", description="Mostra todos os comandos do cassino")
+async def cmd_ajuda(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="🎰 Cassino — Comandos",
+        description="Bem-vindo ao cassino! Aqui estão todos os jogos disponíveis.",
+        color=0xFFD700
+    )
+    embed.add_field(name="💰 Fichas", value=(
+        "`/fichas` — veja seu saldo\n"
+        "Fichas iniciais: **500 🪙** | Salvas permanentemente"
+    ), inline=False)
+    embed.add_field(name="🃏 Truco Paulista", value=(
+        "`/truco 1v1` `/truco 2v2` — multiplayer\n"
+        "`/truco_solo` — contra o bot\n"
+        "`/truco_pedir` — truco/seis/nove/doze\n"
+        "`/minha_mao` · `/placar` · `/encerrar`"
+    ), inline=False)
+    embed.add_field(name="🎴 Blackjack (21)", value=(
+        "`/21` — abre mesa (solo ou até 6 jogadores)\n"
+        "`/21_encerrar` — encerra a mesa"
+    ), inline=False)
+    embed.add_field(name="♠️ Poker Texas Hold'em", value=(
+        "`/poker` — multiplayer (2–9 jogadores)\n"
+        "`/poker_solo` — contra o bot (IA difícil)\n"
+        "`/minhas_cartas` · `/poker_encerrar`"
+    ), inline=False)
+    embed.add_field(name="🎰 Roleta", value=(
+        "`/roleta` — aposte em número, cor, par/ímpar, metade ou dezena\n"
+        "Número certo paga **35x** · Cor paga **2x** · Dezena paga **3x**"
+    ), inline=False)
+    embed.add_field(name="🦁 Jogo do Bicho", value=(
+        "`/bicho` — aposte num dos 25 bichos\n"
+        "Acertar paga **18x** a aposta"
+    ), inline=False)
+    embed.add_field(name="🃏 UNO", value=(
+        "`/uno` — partida de UNO (2–8 jogadores)\n"
+        "`/uno_encerrar` — encerra a partida"
+    ), inline=False)
+    embed.set_footer(text="Boa sorte! 🍀 | Fichas não têm valor real.")
+    await interaction.response.send_message(embed=embed)
+
 # ─────────────────────────────────────────
 #  EVENTOS
 # ─────────────────────────────────────────
 @bot.event
 async def on_ready():
+    global db_pool
+    if HAS_PG and DATABASE_URL:
+        try:
+            db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+            async with db_pool.acquire() as conn:
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS cassino_fichas (
+                        user_id TEXT PRIMARY KEY,
+                        fichas  INTEGER NOT NULL DEFAULT 500
+                    )
+                """)
+            await _carregar_fichas()
+            print("[DB] Postgres conectado e fichas carregadas.")
+        except Exception as e:
+            print(f"[DB] Falha ao conectar Postgres: {e}")
     await bot.tree.sync()
     print(f"✅ {bot.user} online! Comandos sincronizados.")
 
