@@ -770,8 +770,9 @@ def embed_mesa_bj(mesa: MesaBJ, revelar_dealer: bool = False) -> discord.Embed:
             status = " 💥 ESTOUROU"
         elif j.parou:
             status = " ✋ Parou"
+        saldo = get_fichas(j.user.id)
         e.add_field(
-            name=f"{nome} — {val} pts{status} (aposta: {j.aposta} 🪙)",
+            name=f"{nome} — {val} pts{status} | aposta: {j.aposta} 🪙 | saldo: {saldo} 🪙",
             value=formatar_mao(j.mao),
             inline=False
         )
@@ -915,13 +916,20 @@ async def iniciar_rodada_bj(canal, mesa: MesaBJ):
         if calcular_mao(j.mao) == 21:
             j.blackjack = True
 
-    await canal.send("🃏 **Cartas distribuídas!**", embed=embed_mesa_bj(mesa))
-
     # Primeiro jogador que não tem blackjack
     proximo = mesa.proximo_jogador()
     if proximo:
-        await pedir_turno_bj(canal, mesa, proximo)
+        # Manda a primeira mensagem com os botões já incluídos
+        view = JogarBJView(mesa, proximo)
+        val  = calcular_mao(proximo.mao)
+        msg  = await canal.send(
+            f"🃏 **Cartas distribuídas!** | 🎯 **{proximo.user.mention}** é sua vez! **{val}** pts | Aposta: **{proximo.aposta} 🪙**",
+            embed=embed_mesa_bj(mesa),
+            view=view
+        )
+        mesa.msg_id = msg.id
     else:
+        await canal.send("🃏 **Cartas distribuídas!**", embed=embed_mesa_bj(mesa))
         await vez_dealer_bj(canal, mesa)
 
 
