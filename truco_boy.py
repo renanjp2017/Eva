@@ -25,6 +25,28 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+
+async def _atualizar_msg(canal, msg_id: int, content_txt: str = None, embed=None, view=None):
+    """Tenta editar mensagem existente, senão manda nova."""
+    if msg_id:
+        try:
+            msg = await canal.fetch_message(msg_id)
+            kwargs = {}
+            if content_txt is not None: kwargs['content'] = content_txt
+            if embed is not None: kwargs['embed'] = embed
+            if view is not None: kwargs['view'] = view
+            await msg.edit(**kwargs)
+            return msg_id
+        except Exception:
+            pass
+    # Manda nova
+    kwargs = {}
+    if content_txt is not None: kwargs['content'] = content_txt
+    if embed is not None: kwargs['embed'] = embed
+    if view is not None: kwargs['view'] = view
+    msg = await canal.send(**kwargs)
+    return msg.id
+
 # ─────────────────────────────────────────
 #  BARALHO - TRUCO PAULISTA
 #  Ordem de força: 4♣ > 7♥ > A♠ > 7♦ > 3 > 2 > A > K > J > Q > 7 > 6 > 5 > 4
@@ -97,6 +119,7 @@ class JogoTruco:
     truco_por: Optional[int] = None                   # quem pediu truco
     vitorias_rodada: list = field(default_factory=list)  # equipe vencedora de cada mão
     primeiro_a_jogar: int = 0
+    msg_id: int = 0  # ID da mensagem principal para editar
 
 # Armazena jogos ativos por canal
 jogos: dict[int, JogoTruco] = {}
@@ -419,10 +442,10 @@ async def pedir_jogada(canal, jogo: JogoTruco):
 
     embed = embed_mesa(jogo, canal)
     view = JogarCartaView(jogo, atual.id)
-    await canal.send(
-        f"{atual.mention} é sua vez! Escolha uma carta:",
-        embed=embed,
-        view=view
+    jogo.msg_id = await _atualizar_msg(
+        canal, jogo.msg_id,
+        content_txt=f"{atual.mention} é sua vez! Escolha uma carta:",
+        embed=embed, view=view
     )
 
 
@@ -905,10 +928,11 @@ async def iniciar_rodada_bj(canal, mesa: MesaBJ):
 async def pedir_turno_bj(canal, mesa: MesaBJ, jogador: JogadorBJ):
     view = JogarBJView(mesa, jogador)
     val  = calcular_mao(jogador.mao)
-    await canal.send(
-        f"🎯 **{jogador.user.mention}** é sua vez! Você tem **{val}** pontos.\n"
-        f"Aposta: **{jogador.aposta} 🪙**",
-        view=view
+    embed = embed_mesa_bj(mesa)
+    mesa.msg_id = await _atualizar_msg(
+        canal, mesa.msg_id,
+        content_txt=f"🎯 **{jogador.user.mention}** é sua vez! **{val}** pts | Aposta: **{jogador.aposta} 🪙**",
+        embed=embed, view=view
     )
 
 
@@ -2238,6 +2262,7 @@ class MesaUno:
     estado: str = "aguardando"
     cor_curinga: str = ""
     pendurado: int = 0  # +2 ou +4 acumulado
+    msg_id: int = 0  # ID da mensagem principal para editar
 
     def topo(self): return self.descarte[-1] if self.descarte else ""
     def jogador_atual(self): return self.jogadores[self.vez_idx % len(self.jogadores)]
@@ -2309,7 +2334,11 @@ async def pedir_turno_uno(canal, mesa: MesaUno):
         return
 
     view = UnoJogarView(mesa, atual)
-    await canal.send(f"🃏 **{atual.mention}** é sua vez!", embed=embed, view=view)
+    mesa.msg_id = await _atualizar_msg(
+        canal, mesa.msg_id,
+        content_txt=f"🃏 **{atual.mention}** é sua vez!",
+        embed=embed, view=view
+    )
 
 
 class EscolherCorView(discord.ui.View):
@@ -3092,6 +3121,8 @@ class PartidaXadrez:
     en_passant: object = None
     estado: str = "jogando"
     vs_ia: bool = False
+    msg_id: int = 0  # ID da mensagem principal para editar
+    col_sel: int = -1  # coluna selecionada no clique
 
     def jogador_atual_id(self):
         return self.branco_id if self.vez == 'b' else self.preto_id
@@ -3115,49 +3146,21 @@ def coords_para_pos(c, l):
 
 
 async def renderizar_xadrez(canal, partida: PartidaXadrez, msg=""):
-    tab_str = render_tabuleiro(partida.tabuleiro, partida.sel, set(partida.movs) if partida.movs else None)
-    xeque = " ⚠️ **XEQUE!**" if rei_em_xeque(partida.tabuleiro, partida.vez) else ""
+    tab_str  = render_tabuleiro(partida.tabuleiro, partida.sel, set(partida.movs) if partida.movs else None)
+    xeque    = " ⚠️ **XEQUE!**" if rei_em_xeque(partida.tabuleiro, partida.vez) else ""
     cor_nome = "Brancas ♔" if partida.vez == 'b' else "Pretas ♚"
     vez_nome = partida.jogador_atual_nome()
-    txt = f"{tab_str}\n{msg}\nVez de **{vez_nome}** ({cor_nome}){xeque}"
-    await canal.send(txt, view=XadrezView(partida))
-
-
-class XadrezMoverModal(discord.ui.Modal, title="Mover peça"):
-    origem = discord.ui.TextInput(label="De (ex: e2)", max_length=2, min_length=2)
-    destino = discord.ui.TextInput(label="Para (ex: e4)", max_length=2, min_length=2)
-
-    def __init__(self, partida: PartidaXadrez):
-        super().__init__()
-        self.partida = partida
-
-    async def on_submit(self, interaction: discord.Interaction):
-        partida = self.partida
-        uid = interaction.user.id
-        if uid != partida.jogador_atual_id():
-            await interaction.response.send_message("Não é sua vez!", ephemeral=True)
-            return
-
-        orig  = pos_para_coords(self.origem.value)
-        dest  = pos_para_coords(self.destino.value)
-        canal = interaction.channel
-
-        if not orig or not dest:
-            await interaction.response.send_message("Posição inválida! Use formato como 'e2'.", ephemeral=True)
-            return
-
-        tab = partida.tabuleiro
-        if orig not in tab or tab[orig][0] != partida.vez:
-            await interaction.response.send_message("Não há sua peça nessa posição.", ephemeral=True)
-            return
-
-        movs = movimentos_peca(tab, orig, partida.vez, partida.en_passant)
-        if dest not in movs:
-            await interaction.response.send_message("Movimento inválido!", ephemeral=True)
-            return
-
-        await interaction.response.defer()
-        await executar_movimento_xadrez(canal, partida, orig, dest)
+    estado   = ""
+    if partida.sel:
+        col_str = "abcdefgh"[partida.sel[0]]
+        lin_str = str(partida.sel[1] + 1)
+        peca    = partida.tabuleiro.get(partida.sel)
+        peca_str = XADREZ_EMOJIS.get(peca, "?") if peca else "?"
+        n_movs  = len(partida.movs)
+        estado  = f"\nSelecionada: **{peca_str} {col_str}{lin_str}** ({n_movs} movimento(s) disponível) — clique no destino"
+    txt = f"{tab_str}\n{msg}\nVez de **{vez_nome}** ({cor_nome}){xeque}{estado}"
+    view = XadrezView(partida)
+    partida.msg_id = await _atualizar_msg(canal, partida.msg_id, content_txt=txt, view=view)
 
 
 async def executar_movimento_xadrez(canal, partida: PartidaXadrez, orig, dest):
@@ -3167,93 +3170,185 @@ async def executar_movimento_xadrez(canal, partida: PartidaXadrez, orig, dest):
     tipo = peca[1]
     capturou = tab.get(dest)
     partida.en_passant = None
+    partida.sel  = None
+    partida.movs = []
 
-    # En passant
+    # En passant setup
     if tipo == 'P' and abs(orig[1] - dest[1]) == 2:
         dir_ = 1 if cor == 'b' else -1
         partida.en_passant = (orig[0], orig[1] + dir_)
 
     tab[dest] = tab.pop(orig)
 
-    # Promoção de peão
+    # Promoção
     if tipo == 'P' and (dest[1] == 7 or dest[1] == 0):
         tab[dest] = (cor, 'Q')
 
-    # Verifica xeque após movimento
+    # Xeque no próprio rei — desfaz
     if rei_em_xeque(tab, cor):
         tab[orig] = tab.pop(dest)
         if capturou:
             tab[dest] = capturou
-        await canal.send("❌ Movimento inválido: deixa seu rei em xeque!")
+        await canal.send("❌ Movimento inválido: deixa seu rei em xeque!", delete_after=4)
         await renderizar_xadrez(canal, partida)
         return
 
     oponente = 'p' if cor == 'b' else 'b'
     partida.vez = oponente
 
-    # Xeque-mate ou afogamento
     movs_oponente = []
     for pos in list(tab.keys()):
         if tab[pos][0] == oponente:
             movs_oponente.extend(movimentos_peca(tab, pos, oponente, partida.en_passant))
 
+    orig_str = coords_para_pos(*orig)
+    dest_str = coords_para_pos(*dest)
+    emoji_p  = XADREZ_EMOJIS.get(peca, "?")
+    msg      = f"{emoji_p} **{partida.branco_nome if cor == 'b' else partida.preto_nome}**: `{orig_str}→{dest_str}`"
+
     if not movs_oponente:
         if rei_em_xeque(tab, oponente):
             vencedor = partida.branco_nome if cor == 'b' else partida.preto_nome
-            await canal.send(f"♟️ **XEQUE-MATE!** 🏆 **{vencedor}** venceu!")
+            tab_str  = render_tabuleiro(tab)
+            partida.msg_id = await _atualizar_msg(canal, partida.msg_id,
+                content_txt=f"{tab_str}\n♟️ **XEQUE-MATE!** 🏆 **{vencedor}** venceu!", view=None)
         else:
-            await canal.send("♟️ **Afogamento!** Empate!")
+            tab_str = render_tabuleiro(tab)
+            partida.msg_id = await _atualizar_msg(canal, partida.msg_id,
+                content_txt=f"{tab_str}\n♟️ **Afogamento!** Empate!", view=None)
         partida.estado = "fim"
-        tab_str = render_tabuleiro(tab)
-        await canal.send(tab_str)
         view = NovaPartidaXadrezView(partida)
         await canal.send("Jogar de novo?", view=view)
         return
 
-    nome_peca = peca[1]
-    orig_str  = coords_para_pos(*orig)
-    dest_str  = coords_para_pos(*dest)
-    msg       = f"♟️ **{partida.branco_nome if cor == 'b' else partida.preto_nome}** moveu **{nome_peca}** de `{orig_str}` para `{dest_str}`"
-
     await renderizar_xadrez(canal, partida, msg)
 
-    # IA joga se for vs bot
+    # IA joga
     if partida.vs_ia and partida.preto_id == 999999996 and partida.vez == 'p':
         await asyncio.sleep(1.5)
         mov = ia_xadrez(tab, 'p', partida.en_passant)
         if mov:
             await executar_movimento_xadrez(canal, partida, mov[0], mov[1])
         else:
-            await canal.send("🤖 IA não encontrou movimento válido. Empate por afogamento!")
             partida.estado = "fim"
             view = NovaPartidaXadrezView(partida)
-            await canal.send("Jogar de novo?", view=view)
+            await canal.send("🤖 IA sem movimento. Empate!", view=view)
 
 
 class XadrezView(discord.ui.View):
+    """Tabuleiro interativo com seleção por clique (coluna A-H, linha 1-8)."""
     def __init__(self, partida: PartidaXadrez):
         super().__init__(timeout=300)
         self.partida = partida
+        self._build_buttons()
 
-    @discord.ui.button(label="Mover peça", style=discord.ButtonStyle.primary, emoji="♟️")
-    async def mover(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.partida.jogador_atual_id():
-            await interaction.response.send_message("Não é sua vez!", ephemeral=True)
-            return
-        await interaction.response.send_modal(XadrezMoverModal(self.partida))
+    def _build_buttons(self):
+        partida = self.partida
+        # Row 0-1: colunas A-H (selecionar coluna)
+        cols = list("ABCDEFGH")
+        for i, c in enumerate(cols):
+            btn = discord.ui.Button(
+                label=c,
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"col_{i}",
+                row=0
+            )
+            btn.callback = self._make_col_cb(i)
+            self.add_item(btn)
 
-    @discord.ui.button(label="Ver movimentos", style=discord.ButtonStyle.secondary, emoji="🔍")
-    async def ver_movs(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.partida.jogador_atual_id():
-            await interaction.response.send_message("Não é sua vez!", ephemeral=True)
-            return
-        await interaction.response.send_message(
-            "Digite a posição da peça que quer mover (ex: `e2`) e veja os movimentos disponíveis.",
-            ephemeral=True
+        # Row 1: linhas 1-8
+        for l in range(8):
+            btn = discord.ui.Button(
+                label=str(l + 1),
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"lin_{l}",
+                row=1
+            )
+            btn.callback = self._make_lin_cb(l)
+            self.add_item(btn)
+
+        # Row 2: ações
+        abandonar_btn = discord.ui.Button(
+            label="Abandonar 🏳️",
+            style=discord.ButtonStyle.danger,
+            custom_id="abandonar",
+            row=2
         )
+        abandonar_btn.callback = self._abandonar_cb
+        self.add_item(abandonar_btn)
 
-    @discord.ui.button(label="Abandonar", style=discord.ButtonStyle.danger, emoji="🏳️")
-    async def abandonar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        limpar_btn = discord.ui.Button(
+            label="Limpar seleção",
+            style=discord.ButtonStyle.secondary,
+            custom_id="limpar",
+            row=2
+        )
+        limpar_btn.callback = self._limpar_cb
+        self.add_item(limpar_btn)
+
+    def _make_col_cb(self, col: int):
+        async def cb(interaction: discord.Interaction):
+            partida = self.partida
+            if interaction.user.id != partida.jogador_atual_id():
+                await interaction.response.send_message("Não é sua vez!", ephemeral=True)
+                return
+            await interaction.response.defer()
+            partida.col_sel = col
+            # Se já tem linha selecionada, forma a posição
+            # Senão aguarda linha
+            await renderizar_xadrez(interaction.channel, partida, f"Coluna **{'ABCDEFGH'[col]}** selecionada — agora clique na linha (1-8)")
+        return cb
+
+    def _make_lin_cb(self, lin: int):
+        async def cb(interaction: discord.Interaction):
+            partida = self.partida
+            if interaction.user.id != partida.jogador_atual_id():
+                await interaction.response.send_message("Não é sua vez!", ephemeral=True)
+                return
+            if partida.col_sel == -1:
+                await interaction.response.send_message("Selecione a coluna primeiro (A-H)!", ephemeral=True)
+                return
+            await interaction.response.defer()
+            pos = (partida.col_sel, lin)
+            tab = partida.tabuleiro
+
+            if partida.sel is None:
+                # Selecionar peça
+                if pos not in tab or tab[pos][0] != partida.vez:
+                    partida.col_sel = -1
+                    await renderizar_xadrez(interaction.channel, partida, "❌ Não há sua peça nessa casa.")
+                    return
+                movs = movimentos_peca(tab, pos, partida.vez, partida.en_passant)
+                if not movs:
+                    partida.col_sel = -1
+                    await renderizar_xadrez(interaction.channel, partida, "❌ Essa peça não tem movimentos.")
+                    return
+                partida.sel  = pos
+                partida.movs = movs
+                partida.col_sel = -1
+                await renderizar_xadrez(interaction.channel, partida)
+            else:
+                # Mover para destino
+                if pos not in partida.movs:
+                    # Nova seleção?
+                    if pos in tab and tab[pos][0] == partida.vez:
+                        movs = movimentos_peca(tab, pos, partida.vez, partida.en_passant)
+                        partida.sel  = pos
+                        partida.movs = movs
+                        partida.col_sel = -1
+                        await renderizar_xadrez(interaction.channel, partida)
+                    else:
+                        partida.col_sel = -1
+                        await renderizar_xadrez(interaction.channel, partida, "❌ Movimento inválido. Selecione outra peça ou destino válido.")
+                    return
+                orig = partida.sel
+                partida.sel  = None
+                partida.movs = []
+                partida.col_sel = -1
+                await executar_movimento_xadrez(interaction.channel, partida, orig, pos)
+        return cb
+
+    async def _abandonar_cb(self, interaction: discord.Interaction):
         partida = self.partida
         if interaction.user.id not in (partida.branco_id, partida.preto_id):
             await interaction.response.send_message("Você não está nessa partida.", ephemeral=True)
@@ -3262,6 +3357,16 @@ class XadrezView(discord.ui.View):
         partidas_xadrez.pop(partida.canal_id, None)
         self.stop()
         await interaction.response.send_message(f"🏳️ **{interaction.user.display_name}** abandonou. **{vencedor}** vence!")
+
+    async def _limpar_cb(self, interaction: discord.Interaction):
+        if interaction.user.id != self.partida.jogador_atual_id():
+            await interaction.response.send_message("Não é sua vez!", ephemeral=True)
+            return
+        await interaction.response.defer()
+        self.partida.sel     = None
+        self.partida.movs    = []
+        self.partida.col_sel = -1
+        await renderizar_xadrez(interaction.channel, self.partida, "Seleção limpa.")
 
 
 @bot.tree.command(name="xadrez", description="Joga xadrez 1v1 com outro jogador")
@@ -3301,7 +3406,8 @@ async def cmd_xadrez_entrar(interaction: discord.Interaction):
     partida.preto_nome = interaction.user.display_name
     partida.estado     = "jogando"
     await interaction.response.send_message(
-        f"♟️ **{partida.branco_nome}** (♔ Brancas) vs **{partida.preto_nome}** (♚ Pretas)\nBrancas começam!"
+        f"♟️ **{partida.branco_nome}** (♔ Brancas) vs **{partida.preto_nome}** (♚ Pretas)\n"
+        f"Brancas começam! Clique na coluna (A-H) depois na linha (1-8) para mover."
     )
     await renderizar_xadrez(interaction.channel, partida)
 
@@ -3327,7 +3433,8 @@ async def cmd_xadrez_solo(interaction: discord.Interaction):
     )
     partidas_xadrez[canal_id] = partida
     await interaction.response.send_message(
-        f"♟️ **{interaction.user.display_name}** (♔ Brancas) vs **🤖 XadrezBot** (♚ Pretas)\nBrancas começam!"
+        f"♟️ **{interaction.user.display_name}** (♔) vs **🤖 XadrezBot** (♚)\n"
+        f"Clique na coluna (A-H) depois na linha (1-8) para mover."
     )
     await renderizar_xadrez(interaction.channel, partida)
 
@@ -3339,6 +3446,7 @@ async def cmd_xadrez_encerrar(interaction: discord.Interaction):
         await interaction.response.send_message("Não tem xadrez aqui.", ephemeral=True)
         return
     await interaction.response.send_message("❌ Xadrez encerrado.")
+
 
 # ─────────────────────────────────────────
 #  REPLAY VIEWS
