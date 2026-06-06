@@ -1272,8 +1272,7 @@ async def pedir_acao_poker(canal, mesa: MesaPoker):
     saldo = get_fichas(jogador.user.id)
     view  = AcaoPokerView(mesa, jogador, diff, saldo)
     await canal.send(
-        f"🎯 **{jogador.user.mention}** é sua vez!\n"
-        f"Pote: **{mesa.pote} 🪙** | Aposta atual: **{mesa.aposta_atual} 🪙** | Suas fichas: **{saldo} 🪙**"
+        f"🎯 **{jogador.user.mention}** é sua vez!\n Pote: **{mesa.pote} 🪙** | Aposta atual: **{mesa.aposta_atual} 🪙** | Suas fichas: **{saldo} 🪙**"
         + (f" | Para pagar: **{diff} 🪙**" if diff > 0 else " | Pode dar Check"),
         embed=embed_poker(mesa),
         view=view
@@ -1594,6 +1593,339 @@ async def cmd_minhas_cartas(interaction: discord.Interaction):
         f"🃏 Suas cartas: {cartas}\n🏆 Melhor mão atual: **{nome}**",
         ephemeral=True
     )
+
+
+# ─────────────────────────────────────────
+#  CANAL CASSINO
+# ─────────────────────────────────────────
+canais_cassino: set[int] = set()  # vazio = qualquer canal
+
+def checar_canal(canal_id: int) -> bool:
+    return len(canais_cassino) == 0 or canal_id in canais_cassino
+
+@bot.tree.command(name="cassino_set", description="Define este canal como o canal do cassino (Admin)")
+@app_commands.checks.has_permissions(administrator=True)
+async def cmd_cassino_set(interaction: discord.Interaction):
+    canais_cassino.add(interaction.channel_id)
+    await interaction.response.send_message(
+        f"🎰 Este canal agora é o **Cassino**! Só aqui os jogos funcionam."
+    )
+
+@bot.tree.command(name="cassino_remover", description="Remove este canal do cassino (Admin)")
+@app_commands.checks.has_permissions(administrator=True)
+async def cmd_cassino_remover(interaction: discord.Interaction):
+    canais_cassino.discard(interaction.channel_id)
+    msg = "✅ Canal removido do cassino." if canais_cassino or True else "✅ Cassino desativado — jogos liberados em todos os canais."
+    await interaction.response.send_message(msg)
+
+@bot.tree.command(name="cassino_info", description="Mostra onde o cassino está ativo")
+async def cmd_cassino_info(interaction: discord.Interaction):
+    if not canais_cassino:
+        await interaction.response.send_message("🎰 Cassino ativo em **todos os canais**.", ephemeral=True)
+    else:
+        ids = ", ".join(f"<#{c}>" for c in canais_cassino)
+        await interaction.response.send_message(f"🎰 Cassino ativo em: {ids}", ephemeral=True)
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("❌ Você precisa ser Admin para isso.", ephemeral=True)
+
+# ─────────────────────────────────────────
+#  BOT IA - POKER (DIFÍCIL)
+# ─────────────────────────────────────────
+def ia_decidir_poker(jogo: "MesaPoker", jog: "JogadorPoker") -> tuple[str, int]:
+    """
+    Retorna (ação, valor): ação = 'fold'|'call'|'raise'|'check'|'allin'
+    Estratégia difícil: usa força da mão, pot odds e blefe ocasional.
+    """
+    todas     = jog.mao + jogo.comunitarias
+    cat, _    = melhor_mao(todas) if todas else ((0, []), None)
+    if isinstance(cat, tuple):
+        forca = cat[0]
+    else:
+        forca = cat
+
+    saldo      = get_fichas(jog.user.id)
+    diff       = jogo.aposta_atual - jog.aposta_rodada
+    pote       = jogo.pote
+    pot_odds   = diff / (pote + diff) if (pote + diff) > 0 else 0
+
+    # Fase pré-flop: avalia cartas na mão
+    if not jogo.comunitarias:
+        r1, r2 = rank_carta(jog.mao[0]), rank_carta(jog.mao[1])
+        par     = r1 == r2
+        altas   = r1 >= 10 and r2 >= 10
+        conect  = abs(r1 - r2) <= 2
+        if par and r1 >= 10:   forca = 8  # par alto = muito forte pré-flop
+        elif par:               forca = 5
+        elif altas:             forca = 6
+        elif conect:            forca = 3
+        else:                   forca = 1
+
+    blefe = random.random() < 0.12  # 12% de chance de blefar
+
+    if forca >= 7 or blefe:
+        # Mão forte ou blefe: raise agressivo
+        valor_raise = min(saldo, max(jogo.aposta_atual * 3, POKER_BIG_BLIND * 4))
+        if valor_raise >= saldo * 0.8:
+            return ('allin', saldo)
+        return ('raise', valor_raise)
+    elif forca >= 4:
+        # Mão média: call se pot odds valerem
+        if diff == 0:
+            return ('check', 0)
+        if pot_odds < 0.35 or diff <= saldo * 0.3:
+            return ('call', diff)
+        return ('fold', 0)
+    else:
+        # Mão fraca
+        if diff == 0:
+            return ('check', 0)
+        if pot_odds < 0.2 and diff <= POKER_BIG_BLIND * 2:
+            return ('call', diff)
+        return ('fold', 0)
+
+
+async def executar_acao_ia_poker(canal, mesa: "MesaPoker", jog: "JogadorPoker"):
+    await asyncio.sleep(random.uniform(1.2, 2.5))  # simula "pensar"
+    acao, valor = ia_decidir_poker(mesa, jog)
+
+    if acao == 'fold':
+        jog.foldou = True
+        mesa.rodada_apostas += 1
+        await canal.send(f"🤖 **{jog.user.display_name}** deu fold.")
+    elif acao == 'check':
+        mesa.rodada_apostas += 1
+        await canal.send(f"🤖 **{jog.user.display_name}** deu check.")
+    elif acao == 'call':
+        real = min(valor, get_fichas(jog.user.id))
+        _cobrar(mesa, jog, real)
+        mesa.rodada_apostas += 1
+        await canal.send(f"🤖 **{jog.user.display_name}** pagou **{real} 🪙**.")
+    elif acao == 'raise':
+        diff_atual = mesa.aposta_atual - jog.aposta_rodada
+        total      = diff_atual + valor
+        real       = min(total, get_fichas(jog.user.id))
+        _cobrar(mesa, jog, real)
+        mesa.aposta_atual   = jog.aposta_rodada
+        mesa.rodada_apostas = 1
+        await canal.send(f"🤖 **{jog.user.display_name}** fez raise para **{jog.aposta_rodada} 🪙**!")
+    elif acao == 'allin':
+        saldo = get_fichas(jog.user.id)
+        _cobrar(mesa, jog, saldo)
+        if jog.aposta_rodada > mesa.aposta_atual:
+            mesa.aposta_atual   = jog.aposta_rodada
+            mesa.rodada_apostas = 1
+        else:
+            mesa.rodada_apostas += 1
+        await canal.send(f"🤖 **{jog.user.display_name}** foi ALL-IN com **{saldo} 🪙**!")
+
+    mesa.avancar_vez()
+    await pedir_acao_poker(canal, mesa)
+
+
+# ─────────────────────────────────────────
+#  PATCH: checar canal em todos os comandos
+# ─────────────────────────────────────────
+# Monkey-patch: wrap original commands to check casino channel
+_orig_truco    = cmd_truco.callback
+_orig_21       = cmd_21.callback
+_orig_poker    = cmd_poker.callback
+
+async def _truco_checked(interaction: discord.Interaction, modo: str = "1v1"):
+    if not checar_canal(interaction.channel_id):
+        await interaction.response.send_message("🎰 Os jogos só funcionam no canal do cassino!", ephemeral=True)
+        return
+    await _orig_truco(interaction, modo)
+
+async def _21_checked(interaction: discord.Interaction):
+    if not checar_canal(interaction.channel_id):
+        await interaction.response.send_message("🎰 Os jogos só funcionam no canal do cassino!", ephemeral=True)
+        return
+    await _orig_21(interaction)
+
+async def _poker_checked(interaction: discord.Interaction):
+    if not checar_canal(interaction.channel_id):
+        await interaction.response.send_message("🎰 Os jogos só funcionam no canal do cassino!", ephemeral=True)
+        return
+    await _orig_poker(interaction)
+
+cmd_truco.callback = _truco_checked
+cmd_21.callback    = _21_checked
+cmd_poker.callback = _poker_checked
+
+
+# ─────────────────────────────────────────
+#  SOLO - TRUCO CONTRA BOT
+# ─────────────────────────────────────────
+class BotTruco:
+    """Jogador IA para o truco."""
+    def __init__(self, user_fake):
+        self.id           = user_fake.id
+        self.display_name = user_fake.display_name
+
+    async def send(self, *a, **kw):
+        pass  # Bot não recebe DM
+
+
+class FakeUser:
+    def __init__(self, name: str, uid: int):
+        self.id           = uid
+        self.display_name = name
+        self.mention      = name
+
+    async def send(self, *a, **kw):
+        pass
+
+
+def ia_jogar_truco(jogo: JogoTruco, user_id: int) -> str:
+    """Escolhe a melhor carta: joga a mais forte se o adversário já jogou mais forte, senão a mais fraca."""
+    cartas = jogo.maos.get(user_id, [])
+    if not cartas:
+        return cartas[0] if cartas else ""
+
+    # Verifica se adversário já jogou nessa rodada
+    jogadas_adv = [c for uid, c in jogo.mesa if uid != user_id]
+
+    if jogadas_adv:
+        melhor_adv = max(valor_carta(c) for c in jogadas_adv)
+        # Tenta ganhar com a carta mais fraca que ainda bata
+        vencedoras = [c for c in cartas if valor_carta(c) > melhor_adv]
+        if vencedoras:
+            return min(vencedoras, key=valor_carta)
+        else:
+            return min(cartas, key=valor_carta)  # descarta a mais fraca
+    else:
+        # Joga primeiro: carta média (nem revela a melhor, nem desperdiça)
+        ordenadas = sorted(cartas, key=valor_carta)
+        return ordenadas[len(ordenadas) // 2]
+
+
+@bot.tree.command(name="truco_solo", description="Joga Truco contra o bot")
+async def cmd_truco_solo(interaction: discord.Interaction):
+    if not checar_canal(interaction.channel_id):
+        await interaction.response.send_message("🎰 Os jogos só funcionam no canal do cassino!", ephemeral=True)
+        return
+    canal_id = interaction.channel_id
+    if canal_id in jogos:
+        await interaction.response.send_message("Já tem um jogo nesse canal!", ephemeral=True)
+        return
+
+    bot_user = FakeUser("🤖 TrucoBot", 999999999)
+    jogo = JogoTruco(canal_id=canal_id, modo="1v1")
+    jogo.equipe1.jogadores.append(interaction.user)
+    jogo.equipe2.jogadores.append(bot_user)
+    jogos[canal_id] = jogo
+
+    await interaction.response.send_message("🃏 Iniciando Truco contra o Bot...")
+    await iniciar_jogo(interaction.channel, jogo)
+
+
+# ─────────────────────────────────────────
+#  SOLO - 21 CONTRA BOT (já funciona, só confirma)
+# ─────────────────────────────────────────
+# O 21 já suporta 1 jogador contra o dealer — sem mudanças necessárias.
+
+# ─────────────────────────────────────────
+#  SOLO - POKER CONTRA BOT
+# ─────────────────────────────────────────
+@bot.tree.command(name="poker_solo", description="Joga Texas Hold'em contra o bot (IA difícil)")
+async def cmd_poker_solo(interaction: discord.Interaction):
+    if not checar_canal(interaction.channel_id):
+        await interaction.response.send_message("🎰 Os jogos só funcionam no canal do cassino!", ephemeral=True)
+        return
+    canal_id = interaction.channel_id
+    if canal_id in mesas_poker:
+        await interaction.response.send_message("Já tem uma mesa aqui!", ephemeral=True)
+        return
+
+    bot_user = FakeUser("🤖 PokerBot", 999999998)
+    set_fichas(bot_user.id, FICHAS_INICIAIS)
+
+    mesa = MesaPoker(canal_id=canal_id, iniciador_id=interaction.user.id)
+    mesa.jogadores.append(JogadorPoker(user=interaction.user))
+    mesa.jogadores.append(JogadorPoker(user=bot_user))
+    mesas_poker[canal_id] = mesa
+
+    await interaction.response.send_message(
+        f"🤖 Iniciando poker contra **PokerBot** (IA Difícil)! Fichas: **{get_fichas(interaction.user.id)} 🪙**"
+    )
+    await iniciar_partida_poker(interaction.channel, mesa)
+
+
+# ─────────────────────────────────────────
+#  PATCH: pedir_acao_poker verifica se é IA
+# ─────────────────────────────────────────
+_orig_pedir_acao = pedir_acao_poker
+
+async def pedir_acao_poker(canal, mesa: MesaPoker):
+    if len(mesa.ativos()) == 1:
+        await showdown_poker(canal, mesa)
+        return
+
+    podem = mesa.podem_agir()
+    todos_igualaram = all(j.aposta_rodada == mesa.aposta_atual for j in podem)
+    if todos_igualaram and mesa.rodada_apostas >= len(podem):
+        await avancar_fase_poker(canal, mesa)
+        return
+
+    jogador = mesa.jogador_atual()
+    if not jogador:
+        await avancar_fase_poker(canal, mesa)
+        return
+
+    # Se for bot IA, age automaticamente
+    IDS_BOT = {999999998, 999999999}
+    if jogador.user.id in IDS_BOT:
+        await executar_acao_ia_poker(canal, mesa, jogador)
+        return
+
+    diff  = mesa.aposta_atual - jogador.aposta_rodada
+    saldo = get_fichas(jogador.user.id)
+    view  = AcaoPokerView(mesa, jogador, diff, saldo)
+    linha1 = f"🎯 **{jogador.user.mention}** é sua vez!"
+    linha2 = f"Pote: **{mesa.pote} 🪙** | Aposta atual: **{mesa.aposta_atual} 🪙** | Suas fichas: **{saldo} 🪙**"
+    extra  = f" | Para pagar: **{diff} 🪙**" if diff > 0 else " | Pode dar Check"
+    await canal.send(
+        linha1 + " " + linha2 + extra,
+        embed=embed_poker(mesa),
+        view=view
+    )
+
+
+# Substitui a referência global
+import sys
+_mod = sys.modules[__name__]
+setattr(_mod, 'pedir_acao_poker', pedir_acao_poker)
+
+# Atualiza referências nas funções que chamam pedir_acao_poker
+avancar_fase_poker.__globals__['pedir_acao_poker']  = pedir_acao_poker
+showdown_poker.__globals__['pedir_acao_poker']      = pedir_acao_poker
+
+
+# ─────────────────────────────────────────
+#  PATCH: processar_jogada verifica bot truco
+# ─────────────────────────────────────────
+_orig_processar = processar_jogada
+
+async def processar_jogada(canal, jogo: JogoTruco, user_id: int, carta: str):
+    await _orig_processar(canal, jogo, user_id, carta)
+    # Após a jogada, verifica se é vez do bot
+    if canal.id not in jogos:
+        return
+    jogo = jogos.get(canal.id)
+    if not jogo or jogo.estado != EstadoTruco.JOGANDO:
+        return
+    atual = jogador_atual(jogo)
+    if atual and atual.id == 999999999:
+        await asyncio.sleep(1.2)
+        carta_bot = ia_jogar_truco(jogo, atual.id)
+        if carta_bot:
+            await processar_jogada(canal, jogo, atual.id, carta_bot)
+
+setattr(_mod, 'processar_jogada', processar_jogada)
+pedir_jogada.__globals__['processar_jogada'] = processar_jogada
 
 
 # ─────────────────────────────────────────
