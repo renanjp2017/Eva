@@ -966,7 +966,8 @@ async def vez_dealer_bj(canal, mesa: MesaBJ):
 
     embed = embed_mesa_bj(mesa, revelar_dealer=True)
     await canal.send(resultado_txt, embed=embed)
-    mesas_bj.pop(mesa.canal_id, None)
+    view = NovaRodadaBJView(mesa)
+    await canal.send("Jogar de novo?", view=view)
 
 
 # ─── COMANDOS BLACKJACK ───────────────────
@@ -2391,7 +2392,8 @@ class UnoCartaButton(discord.ui.Button):
         # Verifica UNO e vitória
         if len(mao) == 0:
             await canal.send(f"🎉 **{self.jogador.display_name} ganhou o UNO!**")
-            mesas_uno.pop(mesa.canal_id, None)
+            view = NovaRodadaUnoView(mesa)
+            await canal.send("Jogar de novo?", view=view)
             return
         if len(mao) == 1:
             await canal.send(f"⚠️ **{self.jogador.display_name}**: UNO!")
@@ -3202,9 +3204,10 @@ async def executar_movimento_xadrez(canal, partida: PartidaXadrez, orig, dest):
         else:
             await canal.send("♟️ **Afogamento!** Empate!")
         partida.estado = "fim"
-        partidas_xadrez.pop(partida.canal_id, None)
         tab_str = render_tabuleiro(tab)
         await canal.send(tab_str)
+        view = NovaPartidaXadrezView(partida)
+        await canal.send("Jogar de novo?", view=view)
         return
 
     nome_peca = peca[1]
@@ -3222,7 +3225,9 @@ async def executar_movimento_xadrez(canal, partida: PartidaXadrez, orig, dest):
             await executar_movimento_xadrez(canal, partida, mov[0], mov[1])
         else:
             await canal.send("🤖 IA não encontrou movimento válido. Empate por afogamento!")
-            partidas_xadrez.pop(partida.canal_id, None)
+            partida.estado = "fim"
+            view = NovaPartidaXadrezView(partida)
+            await canal.send("Jogar de novo?", view=view)
 
 
 class XadrezView(discord.ui.View):
@@ -3334,6 +3339,103 @@ async def cmd_xadrez_encerrar(interaction: discord.Interaction):
         await interaction.response.send_message("Não tem xadrez aqui.", ephemeral=True)
         return
     await interaction.response.send_message("❌ Xadrez encerrado.")
+
+# ─────────────────────────────────────────
+#  REPLAY VIEWS
+# ─────────────────────────────────────────
+class NovaRodadaBJView(discord.ui.View):
+    def __init__(self, mesa: MesaBJ):
+        super().__init__(timeout=60)
+        self.mesa = mesa
+
+    @discord.ui.button(label="Jogar de novo", style=discord.ButtonStyle.success, emoji="🔄")
+    async def jogar_novo(self, interaction: discord.Interaction, button: discord.ui.Button):
+        mesa = self.mesa
+        if not mesa.get_jogador(interaction.user.id):
+            await interaction.response.send_message("Você não estava nessa mesa.", ephemeral=True)
+            return
+        # Reseta mesa para nova rodada
+        for j in mesa.jogadores:
+            j.mao = []
+            j.aposta = 0
+            j.parou = False
+            j.estourou = False
+            j.blackjack = False
+            saldo = get_fichas(j.user.id)
+            if saldo < APOSTA_MINIMA:
+                set_fichas(j.user.id, FICHAS_INICIAIS)
+        mesa.dealer_mao = []
+        mesa.baralho = []
+        mesa.estado = "apostando"
+        self.stop()
+        view = ApostarView(mesa)
+        saldos = "\n".join(f"**{j.user.display_name}**: {get_fichas(j.user.id)} 🪙" for j in mesa.jogadores)
+        await interaction.response.send_message(f"🔄 **Nova rodada!**\n{saldos}\n\nFaça suas apostas!", view=view)
+
+    @discord.ui.button(label="Encerrar", style=discord.ButtonStyle.danger, emoji="❌")
+    async def encerrar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        mesas_bj.pop(self.mesa.canal_id, None)
+        self.stop()
+        await interaction.response.send_message("❌ Mesa encerrada.")
+
+
+class NovaRodadaUnoView(discord.ui.View):
+    def __init__(self, mesa: "MesaUno"):
+        super().__init__(timeout=60)
+        self.mesa = mesa
+
+    @discord.ui.button(label="Jogar de novo", style=discord.ButtonStyle.success, emoji="🔄")
+    async def jogar_novo(self, interaction: discord.Interaction, button: discord.ui.Button):
+        mesa = self.mesa
+        if interaction.user not in mesa.jogadores:
+            await interaction.response.send_message("Você não estava nessa partida.", ephemeral=True)
+            return
+        self.stop()
+        await interaction.response.send_message("🔄 Reiniciando UNO!")
+        await iniciar_uno(interaction.channel, mesa)
+
+    @discord.ui.button(label="Encerrar", style=discord.ButtonStyle.danger, emoji="❌")
+    async def encerrar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        mesas_uno.pop(self.mesa.canal_id, None)
+        self.stop()
+        await interaction.response.send_message("❌ UNO encerrado.")
+
+
+class NovaPartidaXadrezView(discord.ui.View):
+    def __init__(self, partida: "PartidaXadrez"):
+        super().__init__(timeout=60)
+        self.partida = partida
+
+    @discord.ui.button(label="Jogar de novo", style=discord.ButtonStyle.success, emoji="🔄")
+    async def jogar_novo(self, interaction: discord.Interaction, button: discord.ui.Button):
+        partida = self.partida
+        if interaction.user.id not in (partida.branco_id, partida.preto_id):
+            await interaction.response.send_message("Você não estava nessa partida.", ephemeral=True)
+            return
+        # Troca cores
+        nova = PartidaXadrez(
+            canal_id=partida.canal_id,
+            branco_id=partida.preto_id,
+            preto_id=partida.branco_id,
+            branco_nome=partida.preto_nome,
+            preto_nome=partida.branco_nome,
+            tabuleiro=tabuleiro_inicial(),
+            estado="jogando",
+            vs_ia=partida.vs_ia
+        )
+        partidas_xadrez[partida.canal_id] = nova
+        self.stop()
+        await interaction.response.send_message(
+            f"🔄 Nova partida! **{nova.branco_nome}** (♔) vs **{nova.preto_nome}** (♚) — cores trocadas!"
+        )
+        await renderizar_xadrez(interaction.channel, nova)
+
+    @discord.ui.button(label="Encerrar", style=discord.ButtonStyle.danger, emoji="❌")
+    async def encerrar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        partidas_xadrez.pop(self.partida.canal_id, None)
+        self.stop()
+        await interaction.response.send_message("❌ Xadrez encerrado.")
+
 
 # ─────────────────────────────────────────
 #  EVENTOS
