@@ -5,7 +5,7 @@ import random
 import asyncio
 from dataclasses import dataclass, field
 from typing import Optional
-from .base import get_fichas, set_fichas, checar_canal, atualizar_msg, FakeUser, FICHAS_INICIAIS, APOSTA_MINIMA, APOSTA_MAXIMA
+from .base import get_fichas, set_fichas, checar_canal, atualizar_msg, FakeUser, FICHAS_INICIAIS, APOSTA_MINIMA, APOSTA_MAXIMA, registrar_resultado, registrar_atividade, cancelar_timeout
 
 
 partidas_xadrez: dict = {}  # canal_id -> PartidaXadrez
@@ -188,6 +188,7 @@ def coords_para_pos(c, l):
 
 
 async def renderizar_xadrez(canal, partida: PartidaXadrez, msg=""):
+    registrar_atividade(partida.canal_id, _encerrar_xadrez_timeout)
     tab_str  = render_tabuleiro(partida.tabuleiro, partida.sel, set(partida.movs) if partida.movs else None)
     xeque    = " ⚠️ **XEQUE!**" if rei_em_xeque(partida.tabuleiro, partida.vez) else ""
     cor_nome = "Brancas ♔" if partida.vez == 'b' else "Pretas ♚"
@@ -412,9 +413,27 @@ class XadrezView(discord.ui.View):
 
 
 
+async def _encerrar_xadrez_timeout(canal_id: int, motivo: str):
+    partidas_xadrez.pop(canal_id, None)
+    try:
+        canal = None
+        for guild in _bot_ref_xadrez.guilds:
+            canal = guild.get_channel(canal_id)
+            if canal:
+                break
+        if canal:
+            await canal.send("⏰ Jogo de **Xadrez** encerrado por inatividade (10 min).")
+    except Exception as e:
+        print(f"[TIMEOUT XADREZ] {e}")
+
+_bot_ref_xadrez = None
+
+
 class XadrezCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        global _bot_ref_xadrez
+        _bot_ref_xadrez = bot
 
 
     @app_commands.command(name="xadrez", description="Joga xadrez 1v1 com outro jogador")
@@ -495,5 +514,4 @@ class XadrezCog(commands.Cog):
 
 
 
-async def setup(bot: commands.Bot):
-    await bot.add_cog(XadrezCog(bot))
+async def setup(bot: commands.Bot
