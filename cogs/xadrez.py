@@ -514,4 +514,5 @@ class XadrezCog(commands.Cog):
 
 
 
-async def setup(bot: commands.Bot
+async def setup(bot: commands.Bot):
+    await bot.add_cog(XadrezCog(bot))
