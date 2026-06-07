@@ -5,7 +5,7 @@ import random
 import asyncio
 from dataclasses import dataclass, field
 from typing import Optional
-from .base import get_fichas, set_fichas, checar_canal, atualizar_msg, FakeUser, FICHAS_INICIAIS, APOSTA_MINIMA, APOSTA_MAXIMA
+from .base import get_fichas, set_fichas, checar_canal, atualizar_msg, FakeUser, FICHAS_INICIAIS, APOSTA_MINIMA, APOSTA_MAXIMA, registrar_resultado, registrar_atividade, cancelar_timeout
 
 
 jogos: dict = {}  # canal_id -> JogoTruco
@@ -397,6 +397,7 @@ async def iniciar_jogo(canal, jogo: JogoTruco):
 
 
 async def pedir_jogada(canal, jogo: JogoTruco):
+    registrar_atividade(jogo.canal_id, _encerrar_truco_timeout)
     atual = jogador_atual(jogo)
     cartas = jogo.maos.get(atual.id, [])
     if not cartas:
@@ -489,9 +490,27 @@ async def nova_rodada(canal, jogo: JogoTruco):
 #  COMANDOS SLASH
 # ─────────────────────────────────────────
 
+async def _encerrar_truco_timeout(canal_id: int, motivo: str):
+    jogos.pop(canal_id, None)
+    try:
+        canal = None
+        for guild in _bot_ref_truco.guilds:
+            canal = guild.get_channel(canal_id)
+            if canal:
+                break
+        if canal:
+            await canal.send("⏰ Jogo de **Truco** encerrado por inatividade (10 min).")
+    except Exception as e:
+        print(f"[TIMEOUT TRUCO] {e}")
+
+_bot_ref_truco = None
+
+
 class TrucoCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        global _bot_ref_truco
+        _bot_ref_truco = bot
 
 
     @app_commands.command(name="truco", description="Cria uma partida de Truco Paulista")
