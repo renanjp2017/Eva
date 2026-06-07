@@ -5,7 +5,7 @@ import random
 import asyncio
 from dataclasses import dataclass, field
 from typing import Optional
-from .base import get_fichas, set_fichas, checar_canal, atualizar_msg, FakeUser, FICHAS_INICIAIS, APOSTA_MINIMA, APOSTA_MAXIMA
+from .base import get_fichas, set_fichas, checar_canal, atualizar_msg, FakeUser, FICHAS_INICIAIS, APOSTA_MINIMA, APOSTA_MAXIMA, registrar_resultado, registrar_atividade, cancelar_timeout
 
 
 mesas_uno: dict = {}  # canal_id -> MesaUno
@@ -105,6 +105,7 @@ async def enviar_mao_uno(jogador, mesa: MesaUno):
 
 
 async def pedir_turno_uno(canal, mesa: MesaUno):
+    registrar_atividade(mesa.canal_id, _encerrar_uno_timeout)
     atual = mesa.jogador_atual()
     cartas = mesa.get_mao(atual.id)
     jogaveis = [c for c in cartas if carta_uno_jogavel(c, mesa.topo(), mesa.cor_curinga)]
@@ -293,9 +294,27 @@ class EntrarUnoView(discord.ui.View):
 
 
 
+async def _encerrar_uno_timeout(canal_id: int, motivo: str):
+    mesas_uno.pop(canal_id, None)
+    try:
+        canal = None
+        for guild in _bot_ref_uno.guilds:
+            canal = guild.get_channel(canal_id)
+            if canal:
+                break
+        if canal:
+            await canal.send("⏰ Jogo de **UNO** encerrado por inatividade (10 min).")
+    except Exception as e:
+        print(f"[TIMEOUT UNO] {e}")
+
+_bot_ref_uno = None
+
+
 class UnoCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        global _bot_ref_uno
+        _bot_ref_uno = bot
 
 
     @app_commands.command(name="uno", description="Inicia uma partida de UNO (2-8 jogadores)")
