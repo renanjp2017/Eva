@@ -5,7 +5,7 @@ import random
 import asyncio
 from dataclasses import dataclass, field
 from typing import Optional
-from .base import get_fichas, set_fichas, checar_canal, atualizar_msg, FakeUser, FICHAS_INICIAIS, APOSTA_MINIMA, APOSTA_MAXIMA
+from .base import get_fichas, set_fichas, checar_canal, atualizar_msg, FakeUser, FICHAS_INICIAIS, APOSTA_MINIMA, APOSTA_MAXIMA, registrar_resultado, registrar_atividade, cancelar_timeout
 from itertools import combinations
 
 
@@ -340,7 +340,16 @@ async def showdown_poker(canal, mesa: MesaPoker):
 
         await canal.send(txt, embed=embed_poker(mesa, revelar=True))
 
-    # Pergunta se quer jogar de novo
+    # Registra resultados
+    for j in mesa.jogadores:
+        if j.user.id not in {999999998}:
+            ganhou = j in vencedores if 'vencedores' in dir() else False
+            asyncio.create_task(registrar_resultado(
+                j.user.id, j.user.display_name, "Poker",
+                ganhou, parte if ganhou else j.aposta_rodada
+            ))
+
+    cancelar_timeout(mesa.canal_id)
     view = NovaPartidaView(mesa)
     await canal.send("Quer jogar de novo?", view=view)
 
@@ -532,9 +541,32 @@ class EntrarPokerView(discord.ui.View):
 
 # ── Comandos slash ─────────────────────────────────────────────────────────
 
+async def _encerrar_poker_timeout(canal_id: int, motivo: str):
+    from . import poker as _self
+    mesa = mesas_poker.pop(canal_id, None)
+    if not mesa:
+        return
+    try:
+        canal = None
+        for guild in _self._bot_ref.guilds:
+            canal = guild.get_channel(canal_id)
+            if canal:
+                break
+        if canal:
+            atual = mesa.jogador_atual()
+            mencao = atual.user.mention if atual and hasattr(atual.user, 'mention') else ""
+            await canal.send(f"⏰ {mencao} Partida de poker encerrada por **inatividade** (10 min sem ação).")
+    except Exception as e:
+        print(f"[TIMEOUT POKER] {e}")
+
+_bot_ref = None
+
+
 class PokerCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        global _bot_ref
+        _bot_ref = bot
 
 
     @app_commands.command(name="poker", description="Abre uma mesa de Texas Hold'em")
@@ -698,6 +730,7 @@ class PokerCog(commands.Cog):
         diff  = mesa.aposta_atual - jogador.aposta_rodada
         saldo = get_fichas(jogador.user.id)
         view  = AcaoPokerView(mesa, jogador, diff, saldo)
+        registrar_atividade(mesa.canal_id, _encerrar_poker_timeout)
         linha1 = f"🎯 **{jogador.user.mention}** é sua vez!"
         linha2 = f"Pote: **{mesa.pote} 🪙** | Aposta atual: **{mesa.aposta_atual} 🪙** | Suas fichas: **{saldo} 🪙**"
         extra  = f" | Para pagar: **{diff} 🪙**" if diff > 0 else " | Pode dar Check"
