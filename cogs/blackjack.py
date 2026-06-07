@@ -5,7 +5,7 @@ import random
 import asyncio
 from dataclasses import dataclass, field
 from typing import Optional
-from .base import get_fichas, set_fichas, checar_canal, atualizar_msg, FakeUser, FICHAS_INICIAIS, APOSTA_MINIMA, APOSTA_MAXIMA
+from .base import get_fichas, set_fichas, checar_canal, atualizar_msg, FakeUser, FICHAS_INICIAIS, APOSTA_MINIMA, APOSTA_MAXIMA, registrar_resultado, registrar_atividade, cancelar_timeout
 
 
 mesas_bj: dict = {}  # canal_id -> MesaBJ
@@ -340,6 +340,14 @@ async def vez_dealer_bj(canal, mesa: MesaBJ):
 
     embed = embed_mesa_bj(mesa, revelar_dealer=True)
     await canal.send(resultado_txt, embed=embed)
+    cancelar_timeout(mesa.canal_id)
+    for j in mesa.jogadores:
+        if hasattr(j.user, 'id') and j.user.id < 999999990:
+            val = calcular_mao(j.mao)
+            ganhou = not j.estourou and (dealer_estourou or val > dealer_val or j.blackjack)
+            asyncio.create_task(registrar_resultado(
+                j.user.id, j.user.display_name, "Blackjack 21", ganhou, j.aposta
+            ))
     view = NovaRodadaBJView(mesa)
     await canal.send("Jogar de novo?", view=view)
 
@@ -385,9 +393,29 @@ class EntrarBJView(discord.ui.View):
 
 
 
+async def _encerrar_bj_timeout(canal_id: int, motivo: str):
+    mesa = mesas_bj.pop(canal_id, None)
+    if not mesa:
+        return
+    try:
+        canal = None
+        for guild in _bot_ref_bj.guilds:
+            canal = guild.get_channel(canal_id)
+            if canal:
+                break
+        if canal:
+            await canal.send("⏰ Mesa de **Blackjack** encerrada por inatividade (10 min).")
+    except Exception as e:
+        print(f"[TIMEOUT BJ] {e}")
+
+_bot_ref_bj = None
+
+
 class BlackjackCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        global _bot_ref_bj
+        _bot_ref_bj = bot
 
 
     @app_commands.command(name="21", description="Inicia uma mesa de Blackjack (21)")
