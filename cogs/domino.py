@@ -5,7 +5,7 @@ import random
 import asyncio
 from dataclasses import dataclass, field
 from typing import Optional
-from .base import get_fichas, set_fichas, checar_canal, atualizar_msg, FakeUser, FICHAS_INICIAIS, APOSTA_MINIMA, APOSTA_MAXIMA
+from .base import get_fichas, set_fichas, checar_canal, atualizar_msg, FakeUser, FICHAS_INICIAIS, APOSTA_MINIMA, APOSTA_MAXIMA, registrar_resultado, registrar_atividade, cancelar_timeout
 from itertools import product as iproduct
 
 
@@ -141,6 +141,7 @@ def embed_domino(mesa: MesaDomino) -> discord.Embed:
 
 
 async def pedir_turno_domino(canal, mesa: MesaDomino):
+    registrar_atividade(mesa.canal_id, _encerrar_domino_timeout)
     atual = mesa.jogador_atual()
     IDS_BOT_DOM = {999999997}
 
@@ -357,9 +358,27 @@ class EntrarDominoView(discord.ui.View):
 
 
 
+async def _encerrar_domino_timeout(canal_id: int, motivo: str):
+    mesas_domino.pop(canal_id, None)
+    try:
+        canal = None
+        for guild in _bot_ref_domino.guilds:
+            canal = guild.get_channel(canal_id)
+            if canal:
+                break
+        if canal:
+            await canal.send("⏰ Jogo de **Dominó** encerrado por inatividade (10 min).")
+    except Exception as e:
+        print(f"[TIMEOUT DOMINÓ] {e}")
+
+_bot_ref_domino = None
+
+
 class DominoCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        global _bot_ref_domino
+        _bot_ref_domino = bot
 
 
     @app_commands.command(name="domino", description="Inicia uma partida de Dominó")
