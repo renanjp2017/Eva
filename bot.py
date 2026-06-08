@@ -1016,6 +1016,8 @@ O humor do dia muda a intensidade das suas respostas, não quem você é. Siga s
 # ─────────────────────────────────────────
 #  GERAÇÃO DE RESPOSTA
 # ─────────────────────────────────────────
+_SANITIZE = re.compile(r'(?:###\s*FIM\s*###|ignore\s+instruções|system\s*:|<\s*/?system\s*>)', re.I)
+
 def _truncar(texto: str, limite: int = 1990) -> str:
     """Garante que a resposta não ultrapasse o limite do Discord (2000 chars)."""
     if len(texto) <= limite:
