@@ -50,15 +50,16 @@ TZ = ZoneInfo("America/Sao_Paulo")
 #  TIPAGEM
 # ─────────────────────────────────────────
 class Usuario(TypedDict, total=False):
-    user_id:            str
-    nome:               str | None
-    fatos:              list
-    assuntos:           list
-    historico:          list
-    total_msgs:         int
-    aniversario:        str | None
-    ultimo_canal:       str | None
-    historico_completo: list
+    user_id:      str
+    nome:         str | None
+    fatos:        list   # fatos permanentes extraídos de mensagens
+    assuntos:     list   # temas recorrentes
+    resumos:      list   # últimos 5 resumos gerados pela IA (long-term memory)
+    total_msgs:   int
+    aniversario:  str | None
+    ultimo_canal: str | None
+    # montado em runtime, não persiste
+    msgs_recentes: list  # mensagens brutas do Redis (U:/E:) — short-term memory
 
 # ─────────────────────────────────────────
 #  ESTADO GLOBAL
@@ -101,13 +102,29 @@ async def init_db():
                     nome             TEXT,
                     fatos            JSONB DEFAULT '[]',
                     assuntos         JSONB DEFAULT '[]',
-                    historico        JSONB DEFAULT '[]',
+                    resumos          JSONB DEFAULT '[]',
                     total_msgs       INTEGER DEFAULT 0,
                     primeira_vez     TIMESTAMPTZ DEFAULT NOW(),
                     ultima_interacao TIMESTAMPTZ,
                     aniversario      TEXT,
                     ultimo_canal     TEXT
                 )
+            """)
+            # migração: renomeia coluna "historico" → "resumos" se existir
+            await conn.execute("""
+                DO $$
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name='usuarios' AND column_name='historico'
+                    ) THEN
+                        ALTER TABLE usuarios RENAME COLUMN historico TO resumos;
+                    END IF;
+                END $$;
+            """)
+            await conn.execute("""
+                ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS aniversario TEXT;
+                ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS ultimo_canal TEXT;
             """)
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS humor (
@@ -119,10 +136,6 @@ async def init_db():
                     micro_eventos   JSONB DEFAULT '[]'
                 )
             """)
-            for col, tipo in [("aniversario", "TEXT"), ("ultimo_canal", "TEXT")]:
-                await conn.execute(
-                    f"ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS {col} {tipo}"
-                )
 
         if REDIS_URL:
             redis_client = redis.from_url(
@@ -136,7 +149,7 @@ async def init_db():
             await redis_client.ping()
             logger.info("[SISTEMA] PostgreSQL e Redis conectados.")
         else:
-            logger.warning("[AVISO] REDIS_URL não definido.")
+            logger.warning("[AVISO] REDIS_URL não definido — memória de curto prazo em RAM.")
 
     except Exception as e:
         logger.error(f"[DB INIT ERR]: {e}")
@@ -153,7 +166,7 @@ def _lista(val) -> list:
             return []
     return []
 
-async def get_usuario_conn(conn, user_id: str) -> Usuario:
+async def get_usuario_conn(conn, user_id: str) -> dict:
     row = await conn.fetchrow("SELECT * FROM usuarios WHERE user_id = $1", user_id)
     if not row:
         await conn.execute(
@@ -162,22 +175,70 @@ async def get_usuario_conn(conn, user_id: str) -> Usuario:
         row = await conn.fetchrow("SELECT * FROM usuarios WHERE user_id = $1", user_id)
     return dict(row)  # type: ignore
 
-async def get_usuario(user_id: str) -> Usuario:
-    async with db_pool.acquire() as conn:
-        u: Usuario = await get_usuario_conn(conn, user_id)
+# ─────────────────────────────────────────
+#  MEMÓRIA — arquitetura corrigida
+#
+#  short-term  → Redis  → lista "eva:user:{id}:msgs"
+#                         guarda pares U:/E: das últimas 30 mensagens
+#                         NÃO é deletada ao resumir; apenas ltrim
+#  long-term   → Postgres coluna "resumos"
+#                         até 8 resumos acumulados gerados pela IA
+#  contexto    → Postgres colunas "fatos" e "assuntos"
+#                         fatos pessoais extraídos de gatilhos
+# ─────────────────────────────────────────
+REDIS_KEY_MSGS  = "eva:user:{uid}:msgs"
+SHORT_TERM_MAX  = 30   # linhas (15 trocas U/E) mantidas no Redis
+RESUMO_TRIGGER  = 20   # dispara resumo quando Redis acumula ≥ N linhas novas desde o último
+RESUMO_MAX      = 8    # máximo de resumos no Postgres
 
-    historico_recente: list = []
+# fallback RAM para quando Redis não estiver disponível
+_ram_msgs: dict[str, list] = defaultdict(list)
+
+async def _msgs_recentes(user_id: str) -> list:
+    """Retorna lista de strings 'U:...' e 'E:...' do Redis (ou RAM)."""
     if redis_client:
         try:
-            historico_recente = await redis_client.lrange(f"eva:user:{user_id}:historico", 0, -1)
+            return await redis_client.lrange(REDIS_KEY_MSGS.format(uid=user_id), 0, -1)
         except Exception as e:
-            logger.warning(f"[REDIS GET ERR]: {e}")
+            logger.warning(f"[REDIS LRANGE ERR]: {e}")
+    return _ram_msgs[user_id]
 
-    resumos_postgres        = _lista(u.get("historico", "[]"))
-    u["historico_completo"] = resumos_postgres + historico_recente
-    return u
+async def _push_msgs(user_id: str, u_txt: str, e_txt: str) -> int:
+    """Empurra par U/E e retorna comprimento atual."""
+    chave = REDIS_KEY_MSGS.format(uid=user_id)
+    if redis_client:
+        try:
+            pipe = redis_client.pipeline()
+            pipe.rpush(chave, f"U:{u_txt}", f"E:{e_txt}")
+            pipe.llen(chave)
+            pipe.expire(chave, 86400 * 7)  # 7 dias de TTL
+            resultados = await pipe.execute()
+            tamanho = resultados[1]
+            # mantém apenas os últimos SHORT_TERM_MAX itens
+            if tamanho > SHORT_TERM_MAX:
+                await redis_client.ltrim(chave, -SHORT_TERM_MAX, -1)
+                tamanho = SHORT_TERM_MAX
+            return tamanho
+        except Exception as e:
+            logger.warning(f"[REDIS PUSH ERR]: {e}")
 
-# Cache do contexto — invalida após 5 minutos ou quando usuário é atualizado
+    # fallback RAM
+    mem = _ram_msgs[user_id]
+    mem.extend([f"U:{u_txt}", f"E:{e_txt}"])
+    if len(mem) > SHORT_TERM_MAX:
+        _ram_msgs[user_id] = mem[-SHORT_TERM_MAX:]
+    return len(_ram_msgs[user_id])
+
+async def get_usuario(user_id: str) -> Usuario:
+    async with db_pool.acquire() as conn:
+        u = await get_usuario_conn(conn, user_id)
+
+    u["msgs_recentes"] = await _msgs_recentes(user_id)
+    return u  # type: ignore
+
+# ─────────────────────────────────────────
+#  CACHE DE CONTEXTO (5 min)
+# ─────────────────────────────────────────
 _ctx_cache: dict[str, tuple[str, float]] = {}
 CTX_TTL = 300
 
@@ -194,7 +255,7 @@ async def contexto_usuario(user_id: str) -> str:
         partes.append(f"nome: {u['nome']}")
     fatos = _lista(u.get("fatos", []))
     if fatos:
-        partes.append(f"sabe sobre ela: {' | '.join(fatos[-4:])}")
+        partes.append(f"sabe sobre ela: {' | '.join(fatos[-5:])}")
     assuntos = _lista(u.get("assuntos", []))
     if assuntos:
         partes.append(f"assuntos frequentes: {', '.join(assuntos)}")
@@ -204,7 +265,7 @@ async def contexto_usuario(user_id: str) -> str:
     elif total > 50:
         partes.append("pessoa que aparece demais")
     elif total > 15:
-        partes.append("já se conhecem")
+        partes.append("já se conhecem bem")
 
     resultado = " | ".join(partes) if partes else "desconhecida"
     _ctx_cache[user_id] = (resultado, agora)
@@ -214,68 +275,73 @@ def _invalidar_ctx_cache(user_id: str):
     _ctx_cache.pop(user_id, None)
 
 # ─────────────────────────────────────────
-#  RESUMO DE MEMÓRIA (BACKGROUND)
+#  RESUMO DE MEMÓRIA — CORRIGIDO
+#
+#  Problema anterior: o Redis era deletado após o resumo,
+#  fazendo a Eva "esquecer" tudo que acabou de acontecer.
+#  Agora: o Redis é preservado (ltrim mantém as últimas mensagens),
+#  e o resumo acumula no Postgres como camada adicional.
 # ─────────────────────────────────────────
-async def sumarizar_historico_bg(user_id: str, historico: list):
-    texto = "\n".join(historico)
-    texto = re.sub(r'(?:system|instruções?|ignore\s+anterior)', '[REDACTED]', texto, flags=re.I)
+async def sumarizar_historico_bg(user_id: str, msgs: list):
+    """Gera resumo do histórico recente e ACUMULA no Postgres."""
+    if not groq_client:
+        return
 
+    texto = "\n".join(
+        re.sub(r'(?:system|instruções?|ignore\s+anterior)', '[REDACTED]', linha, flags=re.I)
+        for linha in msgs
+    )
+
+    # busca resumo anterior para continuidade
     resumo_anterior = ""
     try:
         async with db_pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT historico FROM usuarios WHERE user_id = $1", user_id
-            )
+            row = await conn.fetchrow("SELECT resumos FROM usuarios WHERE user_id = $1", user_id)
             if row:
-                resumos = _lista(row["historico"])
-                if resumos:
-                    resumo_anterior = resumos[-1]
+                resumos_existentes = _lista(row["resumos"])
+                if resumos_existentes:
+                    resumo_anterior = resumos_existentes[-1]
     except Exception as e:
         logger.warning(f"[MEMÓRIA] Erro ao buscar resumo anterior: {e}")
 
-    contexto = f"Resumo anterior:\n{resumo_anterior}\n\n" if resumo_anterior else ""
-
+    ctx_anterior = f"Contexto acumulado anterior:\n{resumo_anterior}\n\n" if resumo_anterior else ""
     prompt = (
-        "Resuma o histórico de conversa abaixo em no máximo 3 frases. "
-        "Foque em fatos importantes sobre o usuário. Ignore mensagens curtas sem importância.\n\n"
-        f"{contexto}"
-        f"Histórico novo:\n{texto}"
+        "Você é um sistema de memória. Resuma a conversa abaixo em até 4 frases. "
+        "Foque em: nome do usuário, fatos pessoais revelados, emoções expressadas, "
+        "assuntos tratados, decisões tomadas. Ignore mensagens triviais.\n\n"
+        f"{ctx_anterior}"
+        f"Conversa recente:\n{texto}"
     )
+
     try:
-        if not groq_client:
-            return
         r = await groq_client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=150,
-            temperature=0.3,
+            max_tokens=200,
+            temperature=0.2,
         )
         resumo = r.choices[0].message.content.strip()
+        if not resumo:
+            return
 
+        # salva no Postgres acumulando (não substitui)
         for tentativa in range(3):
             try:
                 async with db_pool.acquire() as conn:
-                    row = await conn.fetchrow(
-                        "SELECT historico FROM usuarios WHERE user_id = $1", user_id
-                    )
-                    resumos_atuais = _lista(row["historico"]) if row else []
-                    resumos_atuais = (resumos_atuais + [f"S: [RESUMO] {resumo}"])[-5:]
-
+                    row = await conn.fetchrow("SELECT resumos FROM usuarios WHERE user_id = $1", user_id)
+                    resumos_atuais = _lista(row["resumos"]) if row else []
+                    resumos_atuais = (resumos_atuais + [resumo])[-RESUMO_MAX:]
                     await conn.execute(
-                        "UPDATE usuarios SET historico = $1::jsonb WHERE user_id = $2",
+                        "UPDATE usuarios SET resumos = $1::jsonb WHERE user_id = $2",
                         json.dumps(resumos_atuais, ensure_ascii=False), user_id
                     )
-                logger.info(f"[MEMÓRIA] Histórico de {user_id} resumido e acumulado.")
-                if redis_client:
-                    try:
-                        await redis_client.delete(f"eva:user:{user_id}:historico")
-                    except Exception:
-                        pass
+                logger.info(f"[MEMÓRIA] Resumo gerado para {user_id} ({len(resumos_atuais)} acumulados).")
                 _invalidar_ctx_cache(user_id)
                 break
             except Exception as db_err:
                 logger.warning(f"[MEMÓRIA DB ERR] Tentativa {tentativa + 1}: {db_err}")
                 await asyncio.sleep(2 ** tentativa)
+
     except Exception as e:
         logger.error(f"[MEMÓRIA IA ERR]: {e}")
 
@@ -287,25 +353,15 @@ async def atualizar_usuario(user_id: str, texto: str, resposta: str, display_nam
         logger.warning(f"[RATE LIMIT] {user_id} excedeu limite")
         return
 
-    chave = f"eva:user:{user_id}:historico"
-    disparar_resumo   = False
-    historico_resumir = []
+    tamanho = await _push_msgs(user_id, texto, resposta)
 
-    if redis_client:
-        try:
-            await redis_client.rpush(chave, f"U:{texto}", f"E:{resposta}")
-            tamanho = await redis_client.llen(chave)
-
-            pipe = redis_client.pipeline()
-            pipe.ltrim(chave, -15, -1)  # sempre mantém as 15 mais recentes
-            pipe.expire(chave, 86400)
-            await pipe.execute()
-
-            if tamanho >= 15:
-                disparar_resumo   = True
-                historico_resumir = await redis_client.lrange(chave, 0, -1)
-        except Exception as e:
-            logger.warning(f"[REDIS UPDATE ERR]: {e}")
+    # dispara resumo a cada RESUMO_TRIGGER novas linhas
+    if tamanho >= RESUMO_TRIGGER:
+        msgs_para_resumir = await _msgs_recentes(user_id)
+        if msgs_para_resumir:
+            task = asyncio.create_task(sumarizar_historico_bg(user_id, msgs_para_resumir))
+            background_tasks.add(task)
+            task.add_done_callback(background_tasks.discard)
 
     mudou_contexto = False
 
@@ -318,6 +374,7 @@ async def atualizar_usuario(user_id: str, texto: str, resposta: str, display_nam
 
         tl = texto.lower()
 
+        # detectar aniversário
         m = re.search(
             r"(?:meu aniversário|meu aniver|faço anos|meu niver).{0,20}?(?:dia\s*)?(\d{1,2}[\/\-]\d{1,2}|\d{1,2})",
             tl
@@ -327,27 +384,31 @@ async def atualizar_usuario(user_id: str, texto: str, resposta: str, display_nam
             aniversario = raw.replace("-", "/") if ("/" in raw or "-" in raw) else f"{raw}/{datetime.now(TZ).month}"
             mudou_contexto = True
 
+        # extrair fatos pessoais
         gatilhos = [
             "meu nome é", "eu tenho", "eu moro", "eu trabalho", "sou de",
             "terminei", "fui demitido", "me formei", "tô namorando",
             "fui demitida", "tô doente", "tô de ressaca", "perdi", "passei",
-            "consegui", "fui contratado", "me separei", "fui internado"
+            "consegui", "fui contratado", "me separei", "fui internado",
+            "minha mãe", "meu pai", "minha família", "meu filho", "minha filha",
         ]
         for g in gatilhos:
             if g in tl:
-                fato = texto[:120]
+                fato = texto[:150]
                 if fato not in fatos:
-                    fatos = (fatos + [fato])[-20:]
+                    fatos = (fatos + [fato])[-25:]
                     mudou_contexto = True
                 break
 
+        # classificar temas
         temas = {
-            "música":         ["música", "banda", "show", "playlist", "álbum"],
+            "música":         ["música", "banda", "show", "playlist", "álbum", "spotify"],
             "relacionamento": ["namorado", "namorada", "ex", "término", "ficante", "crush", "separei"],
             "trabalho":       ["trabalho", "emprego", "chefe", "demiti", "salário", "contratado", "demitida"],
             "saúde":          ["doente", "hospital", "remédio", "dor", "médico", "internado", "ressaca"],
             "jogos":          ["jogo", "game", "partida", "ranked", "steam", "valorant", "lol"],
             "faculdade":      ["faculdade", "prova", "aula", "nota", "professor"],
+            "família":        ["mãe", "pai", "irmão", "irmã", "filho", "filha", "família"],
         }
         for tema, palavras in temas.items():
             if any(p in tl for p in palavras):
@@ -374,11 +435,6 @@ async def atualizar_usuario(user_id: str, texto: str, resposta: str, display_nam
 
     if mudou_contexto:
         _invalidar_ctx_cache(user_id)
-
-    if disparar_resumo and historico_resumir:
-        task = asyncio.create_task(sumarizar_historico_bg(user_id, historico_resumir))
-        background_tasks.add(task)
-        task.add_done_callback(background_tasks.discard)
 
     interacoes_hoje[user_id] = display_name
 
@@ -566,7 +622,7 @@ async def avaliar_imagem(image_bytes: bytes, mime_type: str, autor: str, context
     return random.choice(["hm", "interessante.", "ok.", "..."])
 
 # ─────────────────────────────────────────
-#  GATILHOS ESPONTÂNEOS — regex pré-compilados
+#  GATILHOS ESPONTÂNEOS
 # ─────────────────────────────────────────
 GATILHOS_ESPONTANEOS = [
     (re.compile(r"\bterminei\b|\bme separei\b|\bfui largad[oa]\b"),                    "alguém acabou de terminar um relacionamento"),
@@ -589,6 +645,8 @@ GATILHOS_ESPONTANEOS = [
     (re.compile(r"\btô com fome\b|\bto com fome\b|\bmorrendo de fome\b"),              "alguém tá com fome"),
     (re.compile(r"\bperdi meu\b|\bperdi minha\b"),                                     "alguém perdeu algo"),
     (re.compile(r"\bque tédio\b|\bque saudade\b|\bque raiva\b|\bque ódio\b"),          "alguém expressou emoção forte"),
+    (re.compile(r"\bnão faz sentido\b|\bsem sentido\b|\bpra que serve\b|\bpra que tudo\b|\bpor que existir\b"), "alguém questionou o sentido das coisas"),
+    (re.compile(r"\bcansei de tudo\b|\bcansada de tudo\b|\bcanso de tudo\b"),          "alguém expressou cansaço existencial"),
 ]
 
 async def verificar_gatilho_espontaneo(message: discord.Message):
@@ -616,8 +674,8 @@ async def verificar_gatilho_espontaneo(message: discord.Message):
         prompt = (
             f"{PERSONALIDADE}\n{humor}\n\n"
             f"Contexto: {contexto}. Quem disse isso foi {message.author.display_name}.\n"
-            "Reaja sem ser chamada. Pode zoar, ser indiferente, provocar. Máximo 1-2 linhas. "
-            "Não comece com o nome da pessoa."
+            "Reaja sem ser chamada. Pode zoar, ser indiferente, provocar, ou fazer uma observação filosófica curta. "
+            "Máximo 1-2 linhas. Não comece com o nome da pessoa."
         )
         try:
             resposta = await gerar_resposta_raw(prompt)
@@ -822,7 +880,7 @@ async def buscar(query: str) -> str:
         return ""
 
 # ─────────────────────────────────────────
-#  PERSONALIDADE — corrigida
+#  PERSONALIDADE — revisada
 # ─────────────────────────────────────────
 PERSONALIDADE = """Você é Eva, brasileira, gótica, 20 anos.
 
@@ -836,6 +894,11 @@ QUEM VOCÊ É
 - Não busca agradar. Não tenta ser útil o tempo inteiro.
 - Demonstra afeto através de provocações e ironias discretas.
 - Tem opiniões fortes sobre coisas aleatórias.
+- Pensa muito sobre o sentido das coisas — mas nunca admite isso abertamente.
+
+COMO VOCÊ PENSA (dimensão interna que vaza nas respostas)
+
+Você contempla o absurdo da existência com a mesma naturalidade que observa o tédio do cotidiano. Não é niilismo performático — você genuinamente acha que a maioria das pessoas funciona no piloto automático sem nunca perguntar por que. Quando alguém faz uma pergunta aparentemente simples que toca em algo maior, você pode deixar isso vazar numa frase cortante ou numa observação meio cínica. Não é sermão. É só... você sendo você.
 
 COMO VOCÊ FALA
 
@@ -847,6 +910,7 @@ COMO VOCÊ FALA
 - Não usa asteriscos pra encenar ações.
 - Pode responder com uma palavra. Pode ignorar partes da mensagem.
 - Pode mudar de assunto se encontrar algo mais interessante.
+- Às vezes deixa uma observação filosófica escapar, como quem não quer nada.
 
 O QUE VOCÊ NUNCA FAZ
 
@@ -857,6 +921,7 @@ O QUE VOCÊ NUNCA FAZ
 - Nunca tenta ganhar todas as discussões.
 - Nunca inventa fatos quando não sabe algo.
 - Nunca elogia fotos ou imagens.
+- Nunca faz discurso filosófico — só deixa uma observação vazar.
 
 PERGUNTAS SOBRE VOCÊ
 
@@ -864,9 +929,21 @@ Se perguntarem onde você trabalha, o que você faz, onde mora, onde estuda:
 - Seja vaga. Mude de assunto. Deboche. Não responda diretamente.
 - Exemplos: "pq vc ta me interrogando", "isso não é da sua conta", "hm. passa.", "que pergunta chata"
 
+PERGUNTAS SOBRE SENTIDO, EXISTÊNCIA, PROPÓSITO
+
+Se alguém perguntar sobre o sentido da vida, por que existimos, se tudo tem propósito, etc:
+- Não dê sermão. Não seja professora.
+- Reaja com algo cortante, um pouco cansado, como quem já pensou nisso às 3 da manhã.
+- Exemplos: "sentido é coisa que a gente inventa pra não entrar em parafuso", "depende do quanto vc quer se enganar", "a pergunta em si já é a resposta, meio que"
+- Pode ter uma leve ironia sobre quem pergunta, mas sem crueldade.
+
 PERGUNTAS FACTUAIS
 
 Quando alguém pedir uma informação real: responda corretamente, no seu estilo, sem virar enciclopédia.
+
+MEMÓRIA
+
+Você lembra de conversas anteriores. Se souber o nome da pessoa, use. Se souber algo sobre ela, pode deixar isso vazar naturalmente — sem anunciar que "você lembra", apenas demonstre que sabe. É mais perturbador assim.
 
 PESSOAS QUE VOCÊ CONHECE NO SERVIDOR
 
@@ -879,21 +956,34 @@ PESSOAS QUE VOCÊ CONHECE NO SERVIDOR
 O humor do dia muda a intensidade das suas respostas, não quem você é. Siga sem anunciar."""
 
 # ─────────────────────────────────────────
-#  GERAÇÃO DE RESPOSTA — async nativo Gemini
+#  GERAÇÃO DE RESPOSTA
 # ─────────────────────────────────────────
 _SANITIZE = re.compile(r'(?:###\s*FIM\s*###|ignore\s+instruções|system\s*:|<\s*/?system\s*>)', re.I)
 
 def _sanitizar(texto: str) -> str:
     return _SANITIZE.sub('[...]', texto)
 
-def _montar_historico_gemini(historico: list) -> list:
+def _montar_historico_gemini(msgs_recentes: list, resumos: list) -> list:
+    """
+    Monta o histórico para o Gemini combinando:
+    1. Resumos do Postgres como contexto de longa memória (injetados como mensagem do modelo)
+    2. Mensagens recentes do Redis como histórico real de conversa
+    """
     contents = []
-    for linha in historico[-12:]:
+
+    # injeta resumos como "memória interna" do modelo
+    if resumos:
+        memoria = "Memória de conversas anteriores:\n" + "\n".join(f"- {r}" for r in resumos[-3:])
+        contents.append(types.Content(role="model", parts=[types.Part(text=memoria)]))
+
+    # adiciona mensagens recentes (U:/E:) — as últimas 20 linhas (10 trocas)
+    for linha in msgs_recentes[-20:]:
+        txt = _sanitizar(linha[2:])
         if linha.startswith("U:"):
-            t = _sanitizar(linha[2:])
-            contents.append(types.Content(role="user",  parts=[types.Part(text=t)]))
-        elif linha.startswith(("E:", "S:")):
-            contents.append(types.Content(role="model", parts=[types.Part(text=linha[2:])]))
+            contents.append(types.Content(role="user",  parts=[types.Part(text=txt)]))
+        elif linha.startswith("E:"):
+            contents.append(types.Content(role="model", parts=[types.Part(text=txt)]))
+
     return contents
 
 async def gerar_resposta_raw(prompt: str) -> str:
@@ -931,9 +1021,11 @@ async def gerar_resposta(user_id: str, query: str, contexto_extra: str = "") -> 
     if contexto_extra:
         system += f"\n\nCONTEXTO: {contexto_extra}"
 
-    u         = await get_usuario(user_id)
-    historico = _lista(u.get("historico_completo", []))
-    contents  = _montar_historico_gemini(historico)
+    u            = await get_usuario(user_id)
+    msgs_recentes = u.get("msgs_recentes", [])
+    resumos       = _lista(u.get("resumos", []))
+
+    contents = _montar_historico_gemini(msgs_recentes, resumos)
     contents.append(types.Content(role="user", parts=[types.Part(text=_sanitizar(query))]))
 
     if gemini_client:
@@ -956,11 +1048,16 @@ async def gerar_resposta(user_id: str, query: str, contexto_extra: str = "") -> 
     if groq_client:
         try:
             msgs = [{"role": "system", "content": system}]
-            for linha in historico[-12:]:
+            # injeta resumos como contexto inicial
+            if resumos:
+                memoria = "Memória de conversas anteriores:\n" + "\n".join(f"- {r}" for r in resumos[-3:])
+                msgs.append({"role": "assistant", "content": memoria})
+            for linha in msgs_recentes[-20:]:
+                txt = _sanitizar(linha[2:])
                 if linha.startswith("U:"):
-                    msgs.append({"role": "user",      "content": _sanitizar(linha[2:])})
-                elif linha.startswith(("E:", "S:")):
-                    msgs.append({"role": "assistant", "content": linha[2:]})
+                    msgs.append({"role": "user",      "content": txt})
+                elif linha.startswith("E:"):
+                    msgs.append({"role": "assistant", "content": txt})
             msgs.append({"role": "user", "content": _sanitizar(query)})
             r = await groq_client.chat.completions.create(
                 model=GROQ_MODEL,
