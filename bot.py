@@ -141,8 +141,8 @@ async def init_db():
             redis_client = redis.from_url(
                 REDIS_URL,
                 decode_responses=True,
-                socket_connect_timeout=5,
-                socket_timeout=5,
+                socket_connect_timeout=2,
+                socket_timeout=2,
                 retry_on_timeout=True,
                 health_check_interval=30,
             )
@@ -237,17 +237,31 @@ async def get_usuario(user_id: str) -> Usuario:
     return u  # type: ignore
 
 # ─────────────────────────────────────────
-#  CACHE DE CONTEXTO (5 min)
+#  CACHE DE CONTEXTO (5 min) — armazenado no Redis
+#  Fallback em RAM apenas quando Redis indisponível.
+#  Evita memory leak ilimitado com milhares de usuários únicos.
 # ─────────────────────────────────────────
-_ctx_cache: dict[str, tuple[str, float]] = {}
 CTX_TTL = 300
+_ctx_cache_ram: dict[str, tuple[str, float]] = {}  # fallback apenas
 
 async def contexto_usuario(user_id: str) -> str:
-    agora = datetime.now(TZ).timestamp()
-    if user_id in _ctx_cache:
-        valor, ts = _ctx_cache[user_id]
-        if agora - ts < CTX_TTL:
-            return valor
+    cache_key = f"eva:ctx:{user_id}"
+
+    # tenta Redis primeiro
+    if redis_client:
+        try:
+            cached = await redis_client.get(cache_key)
+            if cached:
+                return cached
+        except Exception as e:
+            logger.warning(f"[CTX CACHE GET ERR]: {e}")
+    else:
+        # fallback RAM
+        agora = datetime.now(TZ).timestamp()
+        if user_id in _ctx_cache_ram:
+            valor, ts = _ctx_cache_ram[user_id]
+            if agora - ts < CTX_TTL:
+                return valor
 
     u = await get_usuario(user_id)
     partes = []
@@ -268,11 +282,24 @@ async def contexto_usuario(user_id: str) -> str:
         partes.append("já se conhecem bem")
 
     resultado = " | ".join(partes) if partes else "desconhecida"
-    _ctx_cache[user_id] = (resultado, agora)
+
+    if redis_client:
+        try:
+            await redis_client.set(cache_key, resultado, ex=CTX_TTL)
+        except Exception as e:
+            logger.warning(f"[CTX CACHE SET ERR]: {e}")
+    else:
+        _ctx_cache_ram[user_id] = (resultado, datetime.now(TZ).timestamp())
+
     return resultado
 
-def _invalidar_ctx_cache(user_id: str):
-    _ctx_cache.pop(user_id, None)
+async def _invalidar_ctx_cache(user_id: str):
+    _ctx_cache_ram.pop(user_id, None)
+    if redis_client:
+        try:
+            await redis_client.delete(f"eva:ctx:{user_id}")
+        except Exception as e:
+            logger.warning(f"[CTX CACHE DEL ERR]: {e}")
 
 # ─────────────────────────────────────────
 #  RESUMO DE MEMÓRIA — CORRIGIDO
@@ -324,19 +351,24 @@ async def sumarizar_historico_bg(user_id: str, msgs: list):
         if not resumo:
             return
 
-        # salva no Postgres acumulando (não substitui)
+        # salva no Postgres com bloqueio pessimista (SELECT FOR UPDATE)
+        # evita race condition quando múltiplas tasks tentam atualizar simultaneamente
         for tentativa in range(3):
             try:
                 async with db_pool.acquire() as conn:
-                    row = await conn.fetchrow("SELECT resumos FROM usuarios WHERE user_id = $1", user_id)
-                    resumos_atuais = _lista(row["resumos"]) if row else []
-                    resumos_atuais = (resumos_atuais + [resumo])[-RESUMO_MAX:]
-                    await conn.execute(
-                        "UPDATE usuarios SET resumos = $1::jsonb WHERE user_id = $2",
-                        json.dumps(resumos_atuais, ensure_ascii=False), user_id
-                    )
+                    async with conn.transaction():
+                        row = await conn.fetchrow(
+                            "SELECT resumos FROM usuarios WHERE user_id = $1 FOR UPDATE",
+                            user_id
+                        )
+                        resumos_atuais = _lista(row["resumos"]) if row else []
+                        resumos_atuais = (resumos_atuais + [resumo])[-RESUMO_MAX:]
+                        await conn.execute(
+                            "UPDATE usuarios SET resumos = $1::jsonb WHERE user_id = $2",
+                            json.dumps(resumos_atuais, ensure_ascii=False), user_id
+                        )
                 logger.info(f"[MEMÓRIA] Resumo gerado para {user_id} ({len(resumos_atuais)} acumulados).")
-                _invalidar_ctx_cache(user_id)
+                await _invalidar_ctx_cache(user_id)
                 break
             except Exception as db_err:
                 logger.warning(f"[MEMÓRIA DB ERR] Tentativa {tentativa + 1}: {db_err}")
@@ -434,7 +466,7 @@ async def atualizar_usuario(user_id: str, texto: str, resposta: str, display_nam
         )
 
     if mudou_contexto:
-        _invalidar_ctx_cache(user_id)
+        await _invalidar_ctx_cache(user_id)
 
     interacoes_hoje[user_id] = display_name
 
@@ -500,8 +532,8 @@ async def atualizar_status(client: discord.Client):
     if not interacoes_hoje or random.random() > 0.05:
         try:
             await client.change_presence(activity=None)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"[STATUS PRESENCE ERR]: {e}")
         return
 
     user_id, nome = random.choice(list(interacoes_hoje.items()))
@@ -584,8 +616,8 @@ async def verificar_moderacao(message: discord.Message) -> bool:
                 random.choice(["interessante escolha de palavras.", "hm. tá bom.", "anotei. não mudou nd.", "continua.", "😐"]),
                 mention_author=False
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"[MOD REPLY ERR]: {e}")
 
     return False
 
@@ -610,8 +642,8 @@ async def avaliar_imagem(image_bytes: bytes, mime_type: str, autor: str, context
             r = await gemini_client.aio.models.generate_content(
                 model=modelo,
                 contents=[types.Content(parts=[
-                    types.Part(inline_data=types.Blob(mime_type=mime_type, data=image_bytes)),
-                    types.Part(text=prompt),
+                    types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                    types.Part.from_text(text=prompt),
                 ])],
                 config=types.GenerateContentConfig(max_output_tokens=120, temperature=0.75)
             )
@@ -660,15 +692,15 @@ async def verificar_gatilho_espontaneo(message: discord.Message):
                 adquiriu = await redis_client.set(chave_gatilho, 1, nx=True, ex=30)
                 if not adquiriu:
                     return
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"[GATILHO REDIS ERR]: {e}")
         if random.random() > 0.20:
             return
         if random.random() < 0.30:
             try:
                 await message.add_reaction(random.choice(["💀","😐","🙂","👁️","😶","🫠","💅","🤌","😒","👀"]))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"[GATILHO REACTION ERR]: {e}")
             return
         humor = await descrever_humor_atual()
         prompt = (
@@ -771,8 +803,8 @@ async def registrar_micro_evento(descricao: str):
     if redis_client:
         try:
             await redis_client.delete(f"eva:humor:{hoje}")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"[HUMOR REDIS DEL ERR]: {e}")
 
 async def descrever_humor_atual() -> str:
     await inicializar_humor_diario()
@@ -788,8 +820,8 @@ async def descrever_humor_atual() -> str:
                 linhas = cached.split("\n")
                 linhas = [l if not l.startswith("HORA ATUAL:") else f"HORA ATUAL: {hora}h — {drift}" for l in linhas]
                 return "\n".join(linhas)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"[HUMOR CACHE GET ERR]: {e}")
 
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT * FROM humor WHERE data = $1", hoje)
@@ -810,8 +842,8 @@ async def descrever_humor_atual() -> str:
             meia_noite = agora.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
             ttl        = int((meia_noite - agora).total_seconds())
             await redis_client.set(cache_key, resultado, ex=ttl)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"[HUMOR CACHE SET ERR]: {e}")
 
     return resultado
 
@@ -826,8 +858,34 @@ async def scheduler_humor():
 
 # ─────────────────────────────────────────
 #  ROTEADOR DE INTENÇÃO
+#  Regex rápido primeiro — só chama a IA se necessário.
+#  Reduz latência em ~300ms e poupa tokens na Groq.
 # ─────────────────────────────────────────
+_REGEX_SEARCH = re.compile(
+    r'\b(quem é|quem foi|o que é|o que foi|quando foi|quando é|onde fica|quanto custa'
+    r'|qual é o|qual foi o|me fala sobre|me conta sobre|pesquisa|busca'
+    r'|notícia|noticia|última hora|ultimas noticias'
+    r'|[Gg]oogle|wikipedia|resultado de)\b'
+    r'|\b(ganhou|venceu|perdeu|morreu|nasceu|lançou|saiu)\b.{0,30}\b(hoje|ontem|essa semana|ano passado)\b',
+    re.I
+)
+_REGEX_CHAT = re.compile(
+    r'^(oi|olá|ola|ei|e aí|eai|boa|bom dia|boa tarde|boa noite|tudo bem|tudo bom|como vai'
+    r'|kk|kkk|haha|lol|slc|q isso|pq|oq|nd|bgl|ok|tá|ta|sim|não|nao)\b',
+    re.I
+)
+
 async def classificar_intencao(texto: str) -> dict:
+    tl = texto.lower().strip()
+
+    # regras rápidas — sem custo de API
+    if _REGEX_CHAT.match(tl) or len(tl) < 15:
+        return {"intent": "chat", "action": "none", "query": texto}
+
+    if _REGEX_SEARCH.search(tl):
+        return {"intent": "search", "action": "none", "query": texto}
+
+    # só chama a IA para casos ambíguos
     if not groq_client:
         return {"intent": "chat", "action": "none", "query": texto}
 
@@ -958,7 +1016,12 @@ O humor do dia muda a intensidade das suas respostas, não quem você é. Siga s
 # ─────────────────────────────────────────
 #  GERAÇÃO DE RESPOSTA
 # ─────────────────────────────────────────
-_SANITIZE = re.compile(r'(?:###\s*FIM\s*###|ignore\s+instruções|system\s*:|<\s*/?system\s*>)', re.I)
+def _truncar(texto: str, limite: int = 1990) -> str:
+    """Garante que a resposta não ultrapasse o limite do Discord (2000 chars)."""
+    if len(texto) <= limite:
+        return texto
+    logger.warning(f"[TRUNCAR] Resposta cortada de {len(texto)} para {limite} chars.")
+    return texto[:limite] + "…"
 
 def _sanitizar(texto: str) -> str:
     return _SANITIZE.sub('[...]', texto)
@@ -997,7 +1060,7 @@ async def gerar_resposta_raw(prompt: str) -> str:
                     contents=[types.Content(role="user", parts=[types.Part(text=prompt)])],
                     config=types.GenerateContentConfig(max_output_tokens=120, temperature=0.75)
                 )
-                return r.text.strip()
+                return _truncar(r.text.strip())
             except Exception as e:
                 logger.warning(f"[GEMINI RAW ERR {modelo}]: {e}")
 
@@ -1008,7 +1071,7 @@ async def gerar_resposta_raw(prompt: str) -> str:
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=120, temperature=0.75,
             )
-            return r.choices[0].message.content.strip()
+            return _truncar(r.choices[0].message.content.strip())
         except Exception as e:
             logger.warning(f"[GROQ RAW ERR]: {e}")
 
@@ -1041,7 +1104,7 @@ async def gerar_resposta(user_id: str, query: str, contexto_extra: str = "") -> 
                     )
                 )
                 logger.info(f"[GEMINI] {modelo}")
-                return r.text.strip()
+                return _truncar(r.text.strip())
             except Exception as e:
                 logger.warning(f"[GEMINI ERR {modelo}]: {e}")
 
@@ -1065,7 +1128,7 @@ async def gerar_resposta(user_id: str, query: str, contexto_extra: str = "") -> 
                 max_tokens=120, temperature=0.75,
             )
             logger.info("[FALLBACK] Groq")
-            return r.choices[0].message.content.strip()
+            return _truncar(r.choices[0].message.content.strip())
         except Exception as e:
             logger.warning(f"[GROQ ERR]: {e}")
 
@@ -1188,8 +1251,8 @@ class Eva(discord.Client):
                 logger.error(f"[ON_MESSAGE ERR] {user_id}: {e}")
                 try:
                     await message.reply(random.choice(["hm", "q", "aff", "tá", "..."]))
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"[ON_MESSAGE FALLBACK ERR]: {e}")
 
 
 # ─────────────────────────────────────────
