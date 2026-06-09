@@ -7,3 +7,6 @@ asyncpg==0.31.0
 ddgs==9.14.4
 google-genai==2.7.0
 redis
+CairoSVG
+Jinja2
+Pillow
