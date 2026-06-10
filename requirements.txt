@@ -1,11 +1,20 @@
-discord.py
-openai
-python-dotenv
-requests
-asyncpg
-ddgs
-google-genai
-redis
-CairoSVG
-Jinja2
-Pillow
+# Discord
+discord.py==2.4.0
+
+# IA
+openai==1.35.14
+google-genai==1.16.0
+
+# Banco de dados
+asyncpg==0.29.0
+redis==5.0.7
+
+# Utilitários
+python-dotenv==1.0.1
+requests==2.32.3
+ddgs==6.3.2
+
+# Imagens (truco_bot / renderer)
+Pillow==10.4.0
+CairoSVG==2.7.1
+Jinja2==3.1.4
