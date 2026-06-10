@@ -1,6 +1,6 @@
 """
-truco_bot.py — Entry point do bot.
-Carrega todos os cogs e conecta ao Postgres.
+truco_bot.py — Entry point do bot Cassino.
+Carrega todos os cogs e conecta ao Postgres (Railway).
 """
 import asyncio
 import os
@@ -14,8 +14,11 @@ try:
 except ImportError:
     HAS_PG = False
 
-TOKEN        = os.environ.get("DISCORD_TOKEN", "")
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
+TOKEN = os.environ.get("DISCORD_TOKEN", "")
+
+# Railway usa "postgres://" mas asyncpg exige "postgresql://"
+_raw_db_url = os.environ.get("DATABASE_URL", "")
+DATABASE_URL = _raw_db_url.replace("postgres://", "postgresql://", 1) if _raw_db_url else ""
 
 COGS = [
     "cogs.base",
@@ -36,32 +39,33 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
-    # Sincronização dos comandos de barra (Slash Commands)
     await bot.tree.sync()
     print(f"✅ {bot.user} online! Comandos sincronizados.")
 
 
 async def main():
     async with bot:
-        # 1. Inicialização segura do banco de dados antes de carregar os cogs
+        # 1. Banco de dados
         if HAS_PG and DATABASE_URL:
             import cogs.base as base
             try:
-                base.db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-                async with base.db_pool.acquire() as conn:
-                    await conn.execute("""
-                        CREATE TABLE IF NOT EXISTS cassino_fichas (
-                            user_id TEXT PRIMARY KEY,
-                            fichas  INTEGER NOT NULL DEFAULT 500
-                        )
-                    """)
+                base.db_pool = await asyncpg.create_pool(
+                    DATABASE_URL,
+                    min_size=1,
+                    max_size=5,
+                    command_timeout=30,
+                )
+                await base.init_db()
                 await base.carregar_fichas()
                 print("[DB] Postgres conectado e fichas carregadas.")
             except Exception as e:
-                print(f"[DB] Falha na conexão com o banco de dados: {e}")
+                print(f"[DB] Falha na conexão: {e}")
                 traceback.print_exc()
+        else:
+            if not DATABASE_URL:
+                print("[DB] ⚠️  DATABASE_URL não definida — fichas só em RAM (sem persistência).")
 
-        # 2. Carregamento das extensões (Cogs)
+        # 2. Cogs
         print("[boot] Carregando cogs...")
         for cog in COGS:
             try:
@@ -71,7 +75,7 @@ async def main():
                 print(f"❌ Erro ao carregar {cog}: {e}")
                 traceback.print_exc()
 
-        # 3. Inicialização do bot
+        # 3. Start
         await bot.start(TOKEN)
 
 
