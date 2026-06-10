@@ -1,0 +1,12 @@
+discord.py
+wavelink
+openai
+python-dotenv
+requests
+asyncpg
+ddgs
+google-genai
+redis
+CairoSVG
+Jinja2
+Pillow
