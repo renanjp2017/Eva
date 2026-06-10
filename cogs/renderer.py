@@ -44,7 +44,7 @@ WHITE_O  = (245, 238, 220)
 SHADOW   = (  0,   0,   0)
 
 # ── Cartas ────────────────────────────────────────────────────────────────────
-_CARDS_DIR   = Path(__file__).parent.parent / "cards" / "generated"
+_CARDS_DIR   = Path(__file__).parent.parent / "cards" / "genereted"
 _SUIT_NAMES  = {"♠":"espadas","♥":"copas","♦":"ouros","♣":"paus"}
 _VALUE_NAMES = {"A":"as","J":"valete","Q":"dama","K":"rei",
                 **{str(i):str(i) for i in range(2,11)}}
