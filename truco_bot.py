@@ -1,5 +1,5 @@
 """
-truco_bot.py — Entry point do bot Cassino.
+truco_bot.py — Entry point do bot Cassino (Wonderland/Mad Hatter).
 Carrega todos os cogs e conecta ao Postgres (Railway).
 """
 import asyncio
@@ -20,6 +20,12 @@ TOKEN = os.environ.get("DISCORD_TOKEN", "")
 _raw_db_url = os.environ.get("DATABASE_URL", "")
 DATABASE_URL = _raw_db_url.replace("postgres://", "postgresql://", 1) if _raw_db_url else ""
 
+# ID do seu servidor Discord (para sync instantâneo de slash commands)
+# Coloque o ID do servidor na variável de ambiente GUILD_ID no Railway
+# Para pegar o ID: Discord > Configurações > Modo Desenvolvedor ligado > clique direito no servidor > Copiar ID
+_guild_id = os.environ.get("GUILD_ID", "")
+TEST_GUILD = discord.Object(id=int(_guild_id)) if _guild_id else None
+
 COGS = [
     "cogs.base",
     "cogs.truco",
@@ -39,8 +45,17 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
-    await bot.tree.sync()
-    print(f"✅ {bot.user} online! Comandos sincronizados.")
+    print(f"[boot] {bot.user} online!")
+
+    if TEST_GUILD:
+        # Sync instantâneo no servidor específico (uso durante desenvolvimento)
+        bot.tree.copy_global_to(guild=TEST_GUILD)
+        synced = await bot.tree.sync(guild=TEST_GUILD)
+        print(f"✅ {len(synced)} slash commands sincronizados no servidor (instantâneo).")
+    else:
+        # Sync global — leva até 1h para propagar (use em produção final)
+        synced = await bot.tree.sync()
+        print(f"✅ {len(synced)} slash commands sincronizados globalmente.")
 
 
 async def main():
@@ -80,4 +95,7 @@ async def main():
 
 
 if __name__ == "__main__":
+    if not TOKEN:
+        print("[ERRO CRÍTICO] DISCORD_TOKEN não definido!")
+        exit(1)
     asyncio.run(main())
