@@ -35,7 +35,8 @@ load_dotenv()
 DISCORD_TOKEN  = os.getenv("DISCORD_TOKEN")
 GROQ_API_KEY   = os.getenv("GROQ_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-DATABASE_URL   = os.getenv("DATABASE_URL")
+_raw_db_url    = os.getenv("DATABASE_URL", "")
+DATABASE_URL   = _raw_db_url.replace("postgres://", "postgresql://", 1) if _raw_db_url else ""
 REDIS_URL      = os.getenv("REDIS_URL")
 
 MODELOS_GEMINI = os.getenv("GEMINI_MODELS", "gemini-2.0-flash,gemini-1.5-flash").split(",")
