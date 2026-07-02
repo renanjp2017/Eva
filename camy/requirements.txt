@@ -1,0 +1,6 @@
+discord.py>=2.3.2
+asyncpg>=0.29.0
+redis[asyncio]>=5.0.0
+openai>=1.30.0
+google-genai>=1.0.0
+python-dotenv>=1.0.0
